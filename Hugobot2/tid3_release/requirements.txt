@@ -1,0 +1,5 @@
+numpy>=1.19.0
+pandas>=1.0.0
+scipy>=1.7.0
+tqdm>=4.60.0
+# UEA .ts parsing and dataset download (tid3/datasets.py) use only the standard library.
