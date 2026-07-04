@@ -10,7 +10,6 @@ datasets_to_run = [
     #     'dataset_name': 'falls_trigger',
     #     # Use absolute paths or paths relative to where the orchestration script is run
     #     'data_path': "/mnt/new_groups/robertmo_group/Niv/projects/CPM_model_TVS_exp/Preprocessing/PAA7/falls_triger_top15.csv",
-    #     'matching_path': "/mnt/new_groups/robertmo_group/Niv/projects/CPM_model_TVS_exp/Preprocessing/PAA7/falls_triger_matching.csv" ,
     #     'event_symbol': 999, # Example event symbol
 
     #     # Examples: "tide", "tide_ks", "tide_kl_c1longer", "tide_mw_c0longer"
@@ -50,8 +49,9 @@ datasets_to_run = [
         'dataset_name': 'diabetes',
         # Use absolute paths or paths relative to where the orchestration script is run
         'data_path': "/mnt/new_groups/robertmo_group/Eldar/CPM_dataset/diabetes/diabetes_with_outcome.csv",
-        'matching_path': "/mnt/new_groups/robertmo_group/Eldar/CPM_dataset/diabetes/deb_matching.csv" ,
         'event_symbol': 999, # Example event symbol
+        'horizon': 5, # MARIO forecast horizon (t + horizon); also the Stage 0 embargo size.
+        'target_variable': 1, # MARIO: TemporalPropertyID whose future abstracted state is forecast.
 
         "d_method": (
             ['equal_width','equal_frequency']
@@ -59,19 +59,6 @@ datasets_to_run = [
 
         "b": [2,5], # num_of_bins used in submit_stage1_job
         "ig": [1], # interpolation_gap used in submit_stage1_job
-
-        # --- New parameters for Supervised Abstraction ---
-        # split_event_class: Determines how to split the data for abstraction.
-        #   - False: Standard split (classify entity as a whole).
-        #   - True: Event-based split (data near event = Class 1, rest = Class 0).
-        "split_event_class": [False],
-
-        # event_window: Defines the window size around the event.
-        #   - Continuous (0-1): Percentage of entity length.
-        #   - Integer (>1): Number of time units before the event.
-        #   - Only relevant if split_event_class is True and method is Supervised.
-        "event_window": [12],
-
 
         # Stage 2: Mining parameters
         "mvs": [0.1],
@@ -90,7 +77,6 @@ datasets_to_run = [
     #     'dataset_name': 'icu',
     #     # Use absolute paths or paths relative to where the orchestration script is run
     #     'data_path': "/mnt/new_groups/robertmo_group/Eldar/CPM_dataset/icu/icu_with_outcome_paa_10.csv",
-    #     'matching_path': "/mnt/new_groups/robertmo_group/Eldar/CPM_dataset/icu/icu_matching.csv" ,
     #     'event_symbol': 999, # Example event symbol
     
     #     # Examples: "tide", "tide_ks", "tide_kl_c1longer", "tide_mw_c0longer"
@@ -130,7 +116,6 @@ datasets_to_run = [
     #     'dataset_name': 'ahe_small',
     #     # Use absolute paths or paths relative to where the orchestration script is run
     #     'data_path': "/mnt/new_groups/robertmo_group/Eldar/CPM_dataset/ahe_small/small_ahe_paa_15.csv",
-    #     'matching_path': "/mnt/new_groups/robertmo_group/Eldar/CPM_dataset/ahe_small/small_ahe_matching.csv" ,
     #     'event_symbol': 999, # Example event symbol
     
     #     # Examples: "tide", "tide_ks", "tide_kl_c1longer", "tide_mw_c0longer"

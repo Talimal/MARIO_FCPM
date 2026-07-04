@@ -8,8 +8,26 @@ CODE_DIR = "/mnt/new_groups/robertmo_group/Tali/CPM_Framework_2/"# Example: '/ho
 BASE_OUTPUT_DIR =  "/mnt/new_groups/robertmo_group/Tali/FCPM_expirment"
 
 # --- Core Experiment Settings ---
-N_FOLDS = 5  # Number of cross-validation folds
+N_FOLDS = 1  # Number of cross-validation folds
 SEED = 2026  # Random seed for reproducibility
+
+# --- Forecasting (MARIO) split settings (Stage 0) ---
+# Fraction of entities held out entirely from training (new-entity test regime).
+# Set to 0.0 for pure within-entity forecasting.
+HOLDOUT_ENTITY_FRACTION = 0.2
+# Per-entity chronological cut point, as a fraction of the entity's time span.
+CHRONO_SPLIT_RATIO = 0.8
+# Default forecast horizon / embargo size, used when a dataset does not set
+# its own 'horizon'. HORIZON is conceptually per-dataset.
+DEFAULT_HORIZON = 1
+
+# --- MARIO TIRP selection (Stage 2) ---
+# All mined TIRPs are kept, then filtered to those whose vertical support
+# (as a fraction of training entities) falls in [TIRP_VS_MIN, TIRP_VS_MAX].
+# Defaults are a no-op (keep everything above the mining mvs floor); tighten
+# the range to drop rare (low VS) or ubiquitous/uninformative (high VS) TIRPs.
+TIRP_VS_MIN = 0.0
+TIRP_VS_MAX = 1.0
 DEFAULT_EVENT_SYMBOL = 999  # Default event symbol if not specified per dataset
 BUILD_CPML = True  # Flag to build and evaluate the CPML model
 RUN_STAGE3_5_VALIDATION = False # Make Stage 3.5 optional

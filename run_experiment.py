@@ -465,7 +465,12 @@ def submit_stage0_job(dataset_params, n_folds, dataset_base_dir, log_dir, base_d
         try: script_basename = config.WRAPPER_SCRIPT_PATHS[stage_num]; script_path = os.path.join(config.CODE_DIR, script_basename)
         except KeyError: print(f"ERROR: Wrapper path for Stage {stage_num} missing."); return False
         if not os.path.exists(script_path): print(f"ERROR: Wrapper script not found: {script_path}."); return False
-        arguments = (f"--dataset_name \"{dataset_name}\" --data_path \"{dataset_params['data_path']}\" " f"--matching_path \"{dataset_params['matching_path']}\" --n_folds {n_folds} " f"--dataset_base_dir \"{dataset_base_dir}\"")
+        horizon = dataset_params.get('horizon', config.DEFAULT_HORIZON)
+        split_dir = os.path.join(dataset_base_dir, 'fold_1')  # reuse the former fold slot for the single forecasting split
+        arguments = (f"--dataset_name \"{dataset_name}\" --data_path \"{dataset_params['data_path']}\" "
+                     f"--horizon {horizon} --holdout_entity_fraction {config.HOLDOUT_ENTITY_FRACTION} "
+                     f"--chrono_split_ratio {config.CHRONO_SPLIT_RATIO} --seed {config.SEED} "
+                     f"--split_dir \"{split_dir}\"")
         return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage0_done_file, log_dir, base_dir, config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)
     return False
 
@@ -481,16 +486,10 @@ def submit_stage1_job(dataset_params, fold_num, abs_combo, fold_dir, log_dir, ba
         if not os.path.exists(script_path): print(f"ERROR: Wrapper script not found: {script_path}."); return False
         if not os.path.exists(script_path): print(f"ERROR: Wrapper script not found: {script_path}."); return False
         
-        # Prepare arguments including the new optional ones
-        arguments = (f"--train_data_file \"{train_data_file}\" --test_data_file \"{test_data_file}\" " 
-                     f"--d_method \"{abs_combo['d_method']}\" --num_of_bins {abs_combo['b']} " 
+        # MARIO Stage 1: unsupervised abstraction only, no event/class split args.
+        arguments = (f"--train_data_file \"{train_data_file}\" --test_data_file \"{test_data_file}\" "
+                     f"--d_method \"{abs_combo['d_method']}\" --num_of_bins {abs_combo['b']} "
                      f"--interpolation_gap {abs_combo['ig']} --abstraction_output_dir \"{abstraction_run_dir}\"")
-        
-        # Add conditional arguments if they exist and are not None
-        if abs_combo.get('split_event_class') is not None:
-            arguments += f" --split_event_class {str(abs_combo['split_event_class'])}"
-        if abs_combo.get('event_window') is not None:
-             arguments += f" --event_window {abs_combo['event_window']}"
 
         return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage1_done_file, log_dir, base_dir, config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)
     return False
@@ -499,13 +498,15 @@ def submit_stage2_job(dataset_params, fold_num, abs_combo, mine_combo, abstracti
     stage_num = 2; dataset_name = dataset_params['dataset_name']; abs_param_string = create_param_string(abs_combo, prefix="abs"); mining_param_string = create_param_string(mine_combo, prefix="mine")
     mining_run_dir = os.path.join(abstraction_run_dir, mining_param_string); tirp_objects_output_dir = os.path.join(mining_run_dir, "tirps"); stage2_done_file = os.path.join(mining_run_dir, 'stage2_mining.done')
     if not os.path.exists(stage2_done_file):
-        expected_stage1_output_train = os.path.join(abstraction_run_dir, 'Train', 'KL-class-0.0.txt');
-        if not os.path.exists(expected_stage1_output_train): return False
+        # Stage 1 gate: accept the MARIO single-file output (KL.txt) or the legacy per-class output.
+        train_dir = os.path.join(abstraction_run_dir, 'Train')
+        if not (os.path.exists(os.path.join(train_dir, 'KL.txt')) or
+                os.path.exists(os.path.join(train_dir, 'KL-class-0.0.txt'))): return False
         os.makedirs(tirp_objects_output_dir, exist_ok=True); job_name = f"stg2_{dataset_name}_f{fold_num}_{abs_param_string}_{mining_param_string}"
         try: script_basename = config.WRAPPER_SCRIPT_PATHS[stage_num]; script_path = os.path.join(config.CODE_DIR, script_basename)
         except KeyError: print(f"ERROR: Wrapper path for Stage {stage_num} missing."); return False
         if not os.path.exists(script_path): print(f"ERROR: Wrapper script not found: {script_path}."); return False
-        arguments = (f"--abstraction_output_dir \"{abstraction_run_dir}\" --mining_run_dir \"{mining_run_dir}\" " f"--tirp_objects_output_dir \"{tirp_objects_output_dir}\" --mvs {mine_combo['mvs']} " f"--max_gap {mine_combo['mg']} --relations {mine_combo['rel']} " f"--skip_followers {mine_combo['sf']} --epsilon {mine_combo['e']} " f"--event_symbol {event_symbol}")
+        arguments = (f"--abstraction_output_dir \"{abstraction_run_dir}\" --mining_run_dir \"{mining_run_dir}\" " f"--tirp_objects_output_dir \"{tirp_objects_output_dir}\" --mvs {mine_combo['mvs']} " f"--max_gap {mine_combo['mg']} --relations {mine_combo['rel']} " f"--skip_followers {mine_combo['sf']} --epsilon {mine_combo['e']} " f"--vs_min {config.TIRP_VS_MIN} --vs_max {config.TIRP_VS_MAX}")
         return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage2_done_file, log_dir, base_dir, config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)
     return False
 

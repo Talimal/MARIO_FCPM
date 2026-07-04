@@ -1,0 +1,11 @@
+------------------------------------
+Sat 04 Jul 2026 06:37:11 IDT
+SLURM_JOBID:		18994984
+SLURM_JOB_NODELIST:	cs-cpu-06
+SLURM_SCRATCH_DIR:	
+Allocated Resouces:	cpu - 2 / mem - 10240 MB / gpu - 
+SLURM_GPU_INDEX:	
+Running as talimal from robertmo account with normal QOS
+------------------------------------
+Sat 04 Jul 2026 06:37:07 IDT
+ STARTING JOB WITH THE COMMAND:  sleep 600 

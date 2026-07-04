@@ -1,150 +1,183 @@
 import pandas as pd
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit # Added GroupShuffleSplit
+import numpy as np
 import os
 import argparse
 import sys
-import traceback # Keep for detailed error printing
-from sklearn.utils import shuffle
-from config import SEED
+import traceback
 
-def split_single_dataset_folds(dataset_name, data_path, matching_path, n_folds, dataset_base_dir):
+from config import SEED, HOLDOUT_ENTITY_FRACTION, CHRONO_SPLIT_RATIO
+
+
+def split_dataset_forecasting(dataset_name, data_path, horizon,
+                              holdout_entity_fraction, chrono_split_ratio,
+                              seed, split_dir):
     """
-    Splits a single dataset. If n_folds > 1, uses GroupKFold.
-    If n_folds == 1, uses GroupShuffleSplit for a single train/test split
-    (approximating 80/20 ratio, respecting groups).
-    Saves train/test splits into fold-specific subdirectories.
-    Keeps original validation and prints.
+    MARIO forecasting split (replaces the FCPM K-fold / GroupKFold split).
+
+    Hybrid chronological + entity-holdout split. There is no classification,
+    so there are no folds and no stratification.
+
+    Two-axis partition:
+      1. Entity axis (new-entity generalization): a seeded random
+         `holdout_entity_fraction` of entities are held out entirely and never
+         appear in training. They form the `new_entity` test regime.
+      2. Time axis (temporal forecasting): the remaining "train entities" are
+         cut chronologically at `chrono_split_ratio` of their time span. Their
+         early portion is training; their late portion is the `seen_future`
+         test regime.
+
+    Embargo (correctness-critical): for a train entity, the last `horizon`
+    time units before the cut are dropped from training. A training example at
+    time t has target t + horizon, so without this gap the targets near the cut
+    would leak into the test region. Holdout entities need no embargo.
+
+    Seen-entity context: to score a seen entity's future slice at time t, we
+    still need its pre-cut history to know which TIRP prefixes are active at t.
+    Therefore test.csv carries each seen entity's FULL timeline, with `cut_time`
+    in the manifest marking where scoring begins. Holdout entities are scored
+    across their whole timeline (after a downstream warm-up); their cut_time is
+    left empty (NaN).
+
+    Outputs (into split_dir):
+      train.csv           # train-entities only, pre-cut rows minus the embargo
+      test.csv            # every entity's full timeline (context for seen,
+                          #   full series for holdout)
+      split_manifest.csv  # EntityID, role, test_regime, cut_time
     """
-    # --- Keep original prints ---
-    print(f"--- Starting Stage 0: Fold Splitting for Dataset: {dataset_name} ---")
+    print(f"--- Starting Stage 0: Forecasting Split for Dataset: {dataset_name} ---")
     print(f"Data Path: {data_path}")
-    print(f"Matching Path: {matching_path}")
-    print(f"Number of Folds: {n_folds}")
-    print(f"Output Base Directory for Folds: {dataset_base_dir}")
-    # --- Keep original try/except structure ---
+    print(f"Horizon (embargo): {horizon}")
+    print(f"Holdout entity fraction: {holdout_entity_fraction}")
+    print(f"Chronological split ratio: {chrono_split_ratio}")
+    print(f"Seed: {seed}")
+    print(f"Output split directory: {split_dir}")
+
     try:
-        # --- Keep original Input Validation ---
+        # --- Input validation ---
         if not os.path.exists(data_path):
             print(f"ERROR: Data file not found at {data_path}")
             sys.exit(1)
-        if not os.path.exists(matching_path):
-            print(f"ERROR: Matching file not found at {matching_path}")
+        if not (0.0 <= holdout_entity_fraction < 1.0):
+            print(f"ERROR: holdout_entity_fraction must be in [0.0, 1.0), got {holdout_entity_fraction}")
+            sys.exit(1)
+        if not (0.0 < chrono_split_ratio < 1.0):
+            print(f"ERROR: chrono_split_ratio must be in (0.0, 1.0), got {chrono_split_ratio}")
+            sys.exit(1)
+        if horizon < 0:
+            print(f"ERROR: horizon must be >= 0, got {horizon}")
             sys.exit(1)
 
-        # --- Keep original Load Data ---
+        # --- Load data ---
         print("Loading data...")
         data = pd.read_csv(data_path)
-        matching = pd.read_csv(matching_path)
-        print(f"Data loaded: {data.shape[0]} rows")
-        print(f"Matching loaded: {matching.shape[0]} rows")
+        print(f"Data loaded: {data.shape[0]} rows, {data.shape[1]} columns")
 
-        # Keep original Check required columns
-        if 'EntityID' not in data.columns or 'EntityID' not in matching.columns or 'GroupID' not in matching.columns:
-             print("ERROR: Required columns ('EntityID' in data/matching, 'GroupID' in matching) not found.")
-             sys.exit(1)
+        if 'EntityID' not in data.columns:
+            print("ERROR: Required column 'EntityID' not found in data.")
+            sys.exit(1)
 
-        # --- Prepare for Splitting (common part) ---
-        X_ids = matching['EntityID'] # Use a distinct name
-        groups = matching['GroupID']
-        X_ids, groups = shuffle(X_ids, groups, random_state=SEED)
+        # The pipeline uses Hugobot long format (EntityID, TemporalPropertyID,
+        # TimeStamp, TemporalPropertyValue). Support 'TimeStamp' (long) and fall
+        # back to 'Time' (wide) for genericity.
+        time_col = 'TimeStamp' if 'TimeStamp' in data.columns else (
+            'Time' if 'Time' in data.columns else None)
+        if time_col is None:
+            print("ERROR: No time column found (expected 'TimeStamp' or 'Time').")
+            sys.exit(1)
 
-        # --- Conditional Splitting Logic ---
-        if n_folds == 1:
-            # --- Logic for Single Split ---
-            print("Performing single train/test split (n_folds=1) using GroupShuffleSplit (approx 80/20 ratio)...")
-            gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED) # Use fixed random state
-            # Get the single pair of indices
-            try:
-                 # Using list comprehension to get the first (and only) split
-                 train_index, test_index = next(iter(gss.split(X_ids, y=None, groups=groups)))
-            except StopIteration:
-                 # This might happen if data is too small or groups don't allow splitting at the desired ratio
-                 print("ERROR: GroupShuffleSplit did not yield any splits. Check group structure, data size, and test_size.")
-                 sys.exit(1)
-
-            train_entities = X_ids.iloc[train_index]
-            test_entities = X_ids.iloc[test_index]
-
-            # Keep prints similar to the loop in original code
-            print(f"  Processing Single Split (Fold 1)...")
-            print(f"    Train entities: {len(train_entities)}, Test entities: {len(test_entities)}")
-
-            # Filter data
-            train_data = data[data['EntityID'].isin(train_entities)]
-            test_data = data[data['EntityID'].isin(test_entities)]
-
-            print(f"    Train data shape: {train_data.shape}")
-            print(f"    Test data shape: {test_data.shape}")
-
-            # Save to fold_1 directory
-            fold_num = 1
-            fold_dir = os.path.join(dataset_base_dir, f'fold_{fold_num}')
-            print(f"    Creating output directory: {fold_dir}")
-            os.makedirs(fold_dir, exist_ok=True)
-
-            train_data_file = os.path.join(fold_dir, 'train.csv')
-            test_data_file = os.path.join(fold_dir, 'test.csv')
-
-            print(f"    Saving {os.path.basename(train_data_file)}...")
-            train_data.to_csv(train_data_file, index=False)
-            print(f"    Saving {os.path.basename(test_data_file)}...")
-            test_data.to_csv(test_data_file, index=False)
-
-        elif n_folds > 1:
-            # --- Keep original GroupKFold Logic ---
-            print(f"Performing {n_folds}-fold split using GroupKFold...")
-            gkf = GroupKFold(n_splits=n_folds)
-            fold_num = 1
-            # Check if generator yields anything to avoid issues with too few groups
-            split_generator = gkf.split(X_ids, y=None, groups=groups)
-            try:
-                # Peek at the first split without consuming it from the main generator if possible
-                # A simpler way is just to check if the generator is empty after trying to iterate once
-                # Let's keep it simple and assume it works or fails in the loop
-                 pass
-            except ValueError as ve:
-                 # GroupKFold raises ValueError if n_splits > number of groups
-                 print(f"ERROR during GroupKFold split generation: {ve}")
-                 print("Ensure n_splits is not greater than the number of unique groups.")
-                 sys.exit(1)
-
-
-            for train_index, test_index in split_generator: # Use the original generator
-                train_entities = X_ids.iloc[train_index]
-                test_entities = X_ids.iloc[test_index]
-
-                # Keep original prints inside the loop
-                print(f"  Processing Fold {fold_num}...")
-                print(f"    Train entities: {len(train_entities)}, Test entities: {len(test_entities)}")
-
-                train_data = data[data['EntityID'].isin(train_entities)]
-                test_data = data[data['EntityID'].isin(test_entities)]
-
-                print(f"    Train data shape: {train_data.shape}")
-                print(f"    Test data shape: {test_data.shape}")
-
-                fold_dir = os.path.join(dataset_base_dir, f'fold_{fold_num}')
-                print(f"    Creating output directory: {fold_dir}")
-                os.makedirs(fold_dir, exist_ok=True)
-
-                train_data_file = os.path.join(fold_dir, 'train.csv')
-                test_data_file = os.path.join(fold_dir, 'test.csv')
-
-                print(f"    Saving {os.path.basename(train_data_file)}...")
-                train_data.to_csv(train_data_file, index=False)
-                print(f"    Saving {os.path.basename(test_data_file)}...")
-                test_data.to_csv(test_data_file, index=False)
-
-                fold_num += 1
+        # Class rows (TemporalPropertyID == -1) are per-entity classification
+        # labels, not measurements. They are irrelevant to forecasting but are
+        # carried through untouched (Hugobot drops them for unsupervised methods).
+        # They must be excluded from the chronological cut computation.
+        if 'TemporalPropertyID' in data.columns:
+            is_measurement = data['TemporalPropertyID'] != -1
         else:
-             # Handle n_folds < 1 case
-             print(f"ERROR: n_folds must be >= 1, but received {n_folds}")
-             sys.exit(1)
+            is_measurement = pd.Series(True, index=data.index)
 
-        # --- Keep original finished print ---
-        print(f"--- Finished Stage 0: Fold Splitting for Dataset: {dataset_name} ---")
+        # --- Entity axis: seeded holdout partition ---
+        # Sort entity ids first so the permutation is independent of row order.
+        entities = np.array(sorted(data['EntityID'].unique()))
+        n_entities = len(entities)
+        rng = np.random.default_rng(seed)
+        entities = entities[rng.permutation(n_entities)]
 
-    # --- Keep original except blocks ---
+        n_holdout = int(round(holdout_entity_fraction * n_entities))
+        # Guarantee at least one train entity remains.
+        n_holdout = min(n_holdout, n_entities - 1)
+        holdout_entities = set(entities[:n_holdout])
+        train_entities = set(entities[n_holdout:])
+
+        print(f"Entities: {n_entities} total -> {len(train_entities)} train, "
+              f"{len(holdout_entities)} holdout")
+
+        # --- Time axis: per-train-entity chronological cut ---
+        # cut_time = t_min + ratio * (t_max - t_min), over measurement rows only.
+        train_measure = data[is_measurement & data['EntityID'].isin(train_entities)]
+        t_min = train_measure.groupby('EntityID')[time_col].min()
+        t_max = train_measure.groupby('EntityID')[time_col].max()
+        cut_time = t_min + chrono_split_ratio * (t_max - t_min)
+        cut_map = cut_time.to_dict()
+
+        # Train rows: train entities, keep only rows whose target (t + horizon)
+        # stays within the pre-cut region -> TimeStamp <= cut_time - horizon.
+        # Class rows (TimeStamp 0) pass this filter and stay with the train slice.
+        train_mask = data['EntityID'].isin(train_entities) & (
+            data[time_col] <= data['EntityID'].map(cut_map) - horizon
+        )
+        train_data = data[train_mask].sort_values(['EntityID', time_col])
+
+        # Test rows: every entity's full timeline. Seen entities need their
+        # pre-cut history for prefix context; holdout entities are fully unseen.
+        test_data = data.sort_values(['EntityID', time_col])
+
+        # Warn about train entities that ended up with no usable train rows
+        # (e.g. very short timelines relative to the embargo).
+        train_entities_with_rows = set(train_data['EntityID'].unique())
+        empty_train_entities = train_entities - train_entities_with_rows
+        if empty_train_entities:
+            print(f"WARNING: {len(empty_train_entities)} train entities have no "
+                  f"training rows after the embargo (timeline too short). They "
+                  f"still contribute a seen_future test slice.")
+        if train_data.empty:
+            print("ERROR: No training rows produced. Check horizon / "
+                  "chrono_split_ratio against the entities' timeline lengths.")
+            sys.exit(1)
+
+        # --- Manifest ---
+        manifest_rows = []
+        for e in train_entities:
+            manifest_rows.append({
+                'EntityID': e,
+                'role': 'train',
+                'test_regime': 'seen_future',
+                'cut_time': cut_map.get(e, np.nan),
+            })
+        for e in holdout_entities:
+            manifest_rows.append({
+                'EntityID': e,
+                'role': 'holdout',
+                'test_regime': 'new_entity',
+                'cut_time': np.nan,  # scored from start (after downstream warm-up)
+            })
+        manifest = pd.DataFrame(
+            manifest_rows, columns=['EntityID', 'role', 'test_regime', 'cut_time']
+        ).sort_values('EntityID')
+
+        # --- Save ---
+        os.makedirs(split_dir, exist_ok=True)
+        train_file = os.path.join(split_dir, 'train.csv')
+        test_file = os.path.join(split_dir, 'test.csv')
+        manifest_file = os.path.join(split_dir, 'split_manifest.csv')
+
+        print(f"  Train data shape: {train_data.shape} -> {os.path.basename(train_file)}")
+        train_data.to_csv(train_file, index=False)
+        print(f"  Test data shape: {test_data.shape} -> {os.path.basename(test_file)}")
+        test_data.to_csv(test_file, index=False)
+        print(f"  Manifest rows: {manifest.shape[0]} -> {os.path.basename(manifest_file)}")
+        manifest.to_csv(manifest_file, index=False)
+
+        print(f"--- Finished Stage 0: Forecasting Split for Dataset: {dataset_name} ---")
+
     except FileNotFoundError as e:
         print(f"ERROR: File not found during Stage 0 execution: {e}")
         sys.exit(1)
@@ -153,31 +186,39 @@ def split_single_dataset_folds(dataset_name, data_path, matching_path, n_folds, 
         sys.exit(1)
     except Exception as e:
         print(f"ERROR: An unexpected error occurred during Stage 0 execution: {e}")
-        traceback.print_exc() # Keep detailed traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 0: Split dataset into K folds (GroupKFold) or single split (GroupShuffleSplit if K=1).")
+    parser = argparse.ArgumentParser(
+        description="Stage 0 (MARIO): hybrid chronological + entity-holdout "
+                    "forecasting split."
+    )
     parser.add_argument("--dataset_name", required=True)
     parser.add_argument("--data_path", required=True)
-    parser.add_argument("--matching_path", required=True)
-    parser.add_argument("--n_folds", required=True, type=int, help="Number of folds (>=1). Use 1 for single 80/20 split.")
-    parser.add_argument("--dataset_base_dir", required=True)
+    parser.add_argument("--horizon", required=True, type=float,
+                        help="Forecast horizon; also used as the pre-cut embargo size.")
+    parser.add_argument("--holdout_entity_fraction", type=float,
+                        default=HOLDOUT_ENTITY_FRACTION,
+                        help="Fraction of entities held out entirely (new-entity regime).")
+    parser.add_argument("--chrono_split_ratio", type=float,
+                        default=CHRONO_SPLIT_RATIO,
+                        help="Per-entity past/future cut, as a fraction of time span.")
+    parser.add_argument("--seed", type=int, default=SEED,
+                        help="Random seed for the entity holdout partition.")
+    parser.add_argument("--split_dir", required=True,
+                        help="Output directory for the split (reuses the former fold_1/ slot).")
     args = parser.parse_args()
 
-    # Add explicit check for n_folds >= 1 as argparse type=int doesn't prevent negative values alone
-    if args.n_folds < 1:
-        print(f"ERROR: --n_folds must be 1 or greater, received {args.n_folds}")
-        sys.exit(1)
-
-    # Call the main processing function
-    split_single_dataset_folds(
+    split_dataset_forecasting(
         dataset_name=args.dataset_name,
         data_path=args.data_path,
-        matching_path=args.matching_path,
-        n_folds=args.n_folds,
-        dataset_base_dir=args.dataset_base_dir
+        horizon=args.horizon,
+        holdout_entity_fraction=args.holdout_entity_fraction,
+        chrono_split_ratio=args.chrono_split_ratio,
+        seed=args.seed,
+        split_dir=args.split_dir,
     )
 
     sys.exit(0)
