@@ -591,6 +591,12 @@ def submit_stage3_5_batch_job(dataset_params, fold_num, abs_combo, mine_combo, b
                       f"--abstraction_output_dir \"{abstraction_run_dir}\" "
                       f"--target_variable {target_variable} "
                       f"--horizon {horizon} ")
+         # Pass the raw data so the MSE/MAE/RMSE metrics close the open tail bins from the
+         # data (min / 95th pct) exactly as the eda notebook does; optional (Stage 3.5
+         # falls back to states.csv bin widths if absent).
+         data_path = dataset_params.get('data_path')
+         if data_path:
+             arguments += f"--data_path \"{data_path}\" "
 
          return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage3_5_batch_done_file, log_dir, base_dir,
                                   config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)

@@ -128,6 +128,7 @@ def aggregate_forecasts(forecasts, symbols, context_window=0, method="average"):
     prob_cols = [f"P_{s}" for s in symbols]
 
     # Per-TIRP reduction: mean distribution when a TIRP has several instances at t.
+    # NOTE: can be changed to take the last (t) instance
     reduced = (
         forecasts.groupby(["tirp_id", "EntityID", "current_time"], as_index=False)[prob_cols].mean()
     )

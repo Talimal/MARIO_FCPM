@@ -38,6 +38,78 @@ STAGE5_AGGREGATION_METHOD = "average"
 STAGE5_CONTEXT_WINDOW = 0
 # Per-entity warm-up before new_entity (holdout) rows are scored.
 STAGE5_WARMUP = 0
+
+# =====================================================================
+# MARIO local notebook / debug defaults (explore_stageN.ipynb)
+# ---------------------------------------------------------------------
+# Single-point parameter selection + local output paths shared by the
+# explore_stageN.ipynb debug notebooks. Centralised here so the notebooks
+# stop duplicating these definitions in every "parameters" cell.
+# The SLURM experiment GRID lives in experiment_params.py; the values below
+# are the one-combo picks used for quick local runs on a subsample.
+# =====================================================================
+NB_DATASET_NAME      = "diabetes"
+NB_DATA_PATH         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diabetes", "hemoglobin_data.csv")
+NB_FOLD              = 1
+NB_HORIZON           = 5      # MARIO forecast horizon / Stage 0 embargo
+NB_TARGET_VARIABLE   = 39     # TemporalPropertyID whose future abstracted state is forecast
+
+# Stage 1 — abstraction (single combo)
+NB_D_METHOD          = "equal_frequency"
+NB_NUM_BINS          = 5
+NB_INTERPOLATION_GAP = 1
+
+# Stage 2 — mining (single combo)
+NB_MVS               = 0.1
+NB_MAX_GAP           = 30
+NB_RELATIONS         = 7
+NB_SKIP_FOLLOWERS    = False
+NB_EPSILON           = 0
+
+# Speed knobs
+NB_SUBSAMPLE_ENTITIES = 300   # entities kept from the fold for a quick local run
+NB_N_TIRPS_TO_PROCESS = 30    # how many mined TIRPs to build / forecast
+
+
+def nb_abstraction_tag(d_method=NB_D_METHOD, num_bins=NB_NUM_BINS, interpolation_gap=NB_INTERPOLATION_GAP):
+    """Stage 1 run-tag / output-subdir name for the local notebooks."""
+    return f"{d_method}_bins{num_bins}_ig{interpolation_gap}"
+
+
+def nb_mining_tag(epsilon=NB_EPSILON, max_gap=NB_MAX_GAP, mvs=NB_MVS,
+                  relations=NB_RELATIONS, skip_followers=NB_SKIP_FOLLOWERS):
+    """Stage 2 mine-tag / output-subdir name for the local notebooks."""
+    return f"mine_e{epsilon}-mg{max_gap}-mvs{mvs}-rel{relations}-sf{skip_followers}"
+
+
+def nb_local_dirs(project_dir=None, dataset_name=NB_DATASET_NAME, fold=NB_FOLD):
+    """
+    Standard local-debug output directories shared by the explore_stageN.ipynb
+    notebooks. Returns a dict so each notebook grabs exactly what it needs.
+    `project_dir` defaults to the directory containing this config.py.
+    """
+    if project_dir is None:
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+    fold_name = f"fold_{fold}"
+    stage0_dir = os.path.join(project_dir, "stage0_local_output", dataset_name)
+    fold_dir = os.path.join(stage0_dir, fold_name)
+    stage1_dir = os.path.join(project_dir, "stage1_local_output", dataset_name, fold_name, nb_abstraction_tag())
+    mining_run_dir = os.path.join(project_dir, "stage2_local_output", dataset_name, fold_name, nb_mining_tag())
+    return {
+        "stage0_dir": stage0_dir,
+        "fold_dir": fold_dir,
+        "train_csv": os.path.join(fold_dir, "train.csv"),
+        "test_csv": os.path.join(fold_dir, "test.csv"),
+        "split_manifest": os.path.join(fold_dir, "split_manifest.csv"),
+        "stage1_dir": stage1_dir,
+        "mining_run_dir": mining_run_dir,
+        "tirp_objects_dir": os.path.join(mining_run_dir, "tirp_objects"),
+        "built_models_dir": os.path.join(project_dir, "stage3_local_output", dataset_name, fold_name, "feature_matrix"),
+        "prediction_output_dir": os.path.join(project_dir, "stage4_local_output", dataset_name, fold_name, "predictions"),
+        "stage5_output_dir": os.path.join(project_dir, "stage5_local_output", dataset_name, fold_name),
+    }
+
+
 DEFAULT_EVENT_SYMBOL = 999  # Default event symbol if not specified per dataset
 BUILD_CPML = True  # Flag to build and evaluate the CPML model
 RUN_STAGE3_5_VALIDATION = False # Make Stage 3.5 optional
