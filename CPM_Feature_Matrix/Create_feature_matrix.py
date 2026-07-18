@@ -344,6 +344,267 @@ def build_cpml_training_arrays(durations_df, class_map):
     return X, y, feature_names
 
 
+def _build_entity_sti_index(target_stis):
+    """
+    Preprocess the forecast target variable's STIs into a per-entity lookup of
+    sorted (starts, ends, states) arrays for fast interval-cover queries.
+
+    :param target_stis: DataFrame with columns EntityID, StartTime, EndTime, StateID,
+                        already filtered to the single forecast target variable.
+    :return: dict EntityID(int) -> (starts, ends, states) int64 arrays, sorted by start.
+    """
+    index = {}
+    if target_stis is None or target_stis.empty:
+        return index
+    for entity_id, grp in target_stis.groupby("EntityID"):
+        g = grp.sort_values("StartTime")
+        index[int(entity_id)] = (
+            g["StartTime"].to_numpy(dtype=np.int64),
+            g["EndTime"].to_numpy(dtype=np.int64),
+            g["StateID"].to_numpy(dtype=np.int64),
+        )
+    return index
+
+
+def _lookup_states(entity_index, taus):
+    """
+    For each query time in ``taus``, return the StateID of the target-variable STI
+    covering it (start <= tau <= end), plus a boolean mask of which taus were covered.
+
+    Assumes the entity's STIs are non-overlapping and sorted by start (true for a
+    single abstracted variable), so the covering STI is the last one whose
+    start <= tau. NaN taus (e.g. a NaN TFS) resolve to "not covered" and are dropped.
+
+    :param entity_index: (starts, ends, states) sorted arrays for one entity, or None.
+    :param taus: 1D array of absolute query times (t + HORIZON); may contain NaN.
+    :return: (states, covered) each length len(taus); states is int64 (garbage where ~covered).
+    """
+    n = len(taus)
+    if entity_index is None:
+        return np.zeros(n, dtype=np.int64), np.zeros(n, dtype=bool)
+    starts, ends, states = entity_index
+    # Last interval whose start <= tau; searchsorted puts NaN at the end (idx = last).
+    idx = np.searchsorted(starts, taus, side="right") - 1
+    safe_idx = np.clip(idx, 0, len(starts) - 1)
+    # in-range only if a start <= tau existed AND tau <= that interval's end.
+    # (NaN tau makes tau <= end False, so it is excluded.)
+    covered = (idx >= 0) & (taus <= ends[safe_idx])
+    return states[safe_idx], covered
+
+
+def build_forecast_training_arrays(durations_df, target_stis, horizon):
+    """
+    MARIO forecast feature matrix, built as compact arrays. Each row is one
+    (entity, absolute timestamp t) drawn from the evolving TIRP-prefix durations,
+    and the label ``y`` is the abstracted state of the forecast target variable at
+    absolute time ``t + horizon``.
+
+    This is the forecasting counterpart of ``build_cpml_training_arrays``: the X
+    features are produced by the exact same compact fill (they depend only on
+    ``current_time - start_time``, so the absolute TFS cancels and is bit-identical).
+    The two forecasting-specific changes are:
+      (a) the absolute timestamp = ``TFS + t`` is reconstructed per row so the future
+          label at ``t + horizon`` can be looked up, and
+      (b) rows whose ``t + horizon`` is not covered by any target STI (a gap or the end
+          of the entity's data) are dropped from BOTH X and y -- matching the global
+          label definition ("if no STI covers t+HORIZON, that (entity, t) is dropped").
+
+    Unlike the FCPM path, ``y`` varies per timestamp (a categorical target symbol),
+    not per entity, so the downstream model is multiclass rather than binary.
+
+    :param durations_df: DataFrame ["EntityID", <duration cols...>, "TFS"], one row per instance.
+    :param target_stis: DataFrame [EntityID, StartTime, EndTime, StateID] of the forecast
+                        target variable only (from the Train KL when training).
+    :param horizon: forecast lead time in TimeStamp units.
+    :return: (X, y, feature_names)
+             X            : np.ndarray (n_kept, 2*D) integer feature matrix
+             y            : np.ndarray (n_kept,) int32 target StateID at t + horizon
+             feature_names: list[str] length 2*D giving the column order of X
+                            (matches the names create_test_feature_matrix emits).
+    """
+    entity_col = "EntityID"
+    time_cols = [c for c in durations_df.columns if c not in (entity_col, "TFS", "event_time")]
+    D = len(time_cols)
+
+    feature_names = []
+    for c in time_cols:
+        feature_names.append(f"{c}_Binary")
+        feature_names.append(f"{c}_Duration")
+
+    if durations_df.empty or D == 0:
+        return (np.empty((0, 2 * D), dtype=np.int16),
+                np.empty((0,), dtype=np.int32),
+                feature_names)
+
+    # Duration cells as float (may contain NaN); round to guard against "62.0" text
+    # and binary float artifacts. Matches build_cpml_training_arrays.
+    dur = np.round(durations_df[time_cols].to_numpy(dtype=np.float64))
+    ent = durations_df[entity_col].to_numpy()
+    tfs = durations_df["TFS"].to_numpy(dtype=np.float64)
+
+    with np.errstate(invalid="ignore"):
+        spans_int = np.nansum(dur, axis=1).astype(np.int64)
+    n = int(spans_int.sum() + len(durations_df))  # +1 row per instance (t = 0..span)
+
+    max_val = int(spans_int.max()) if len(spans_int) else 0
+    idtype = np.int16 if max_val <= np.iinfo(np.int16).max else np.int32
+
+    # Preallocate the full (pre-drop) matrix; the keep-mask compacts it at the end.
+    X = np.empty((n, 2 * D), dtype=idtype)
+    y = np.empty((n,), dtype=np.int32)
+    keep = np.zeros((n,), dtype=bool)
+
+    sti_index = _build_entity_sti_index(target_stis)
+
+    pos = 0
+    for r in range(len(durations_df)):
+        dv = dur[r]                       # (D,) float, may contain NaN
+        span = int(spans_int[r])
+        T = span + 1
+        t = np.arange(T)                  # relative timestamps 0..span
+
+        # Relative interval start times; cumsum propagates NaN exactly like the original.
+        start_rel = np.empty(D, dtype=np.float64)
+        start_rel[0] = 0.0
+        if D > 1:
+            start_rel[1:] = np.cumsum(dv)[:-1]
+
+        with np.errstate(invalid="ignore"):
+            rel = t[:, None] - start_rel[None, :]   # (T, D); NaN where start_rel is NaN
+            observed = rel >= 0                     # (NaN >= 0) -> False
+            capped = np.minimum(rel, dv[None, :])   # np.minimum propagates NaN
+            progress = np.where(np.isnan(dv)[None, :], rel, capped)
+            progress = np.where(observed, progress, 0.0)
+
+        block = X[pos:pos + T]
+        block[:, 0::2] = observed                   # bool -> int (Binary)
+        block[:, 1::2] = np.rint(progress)          # whole values -> int (Duration)
+
+        # Forecast label: state of the target variable at absolute time t + horizon.
+        taus = tfs[r] + t + horizon                 # absolute future query times
+        states, covered = _lookup_states(sti_index.get(int(ent[r])), taus)
+        y[pos:pos + T] = states
+        keep[pos:pos + T] = covered
+        pos += T
+
+    return X[keep], y[keep], feature_names
+
+
+def build_forecast_inference_matrix(durations_df, target_stis, horizon):
+    """
+    MARIO forecast feature matrix for INFERENCE on the test set (Stage 4).
+
+    Uses the exact same compact per-(entity, absolute t) feature fill as
+    ``build_forecast_training_arrays`` (the X features are bit-identical -- they depend
+    only on ``current_time - start_time``, so the absolute TFS cancels), but it is built
+    for scoring a saved model on unseen data rather than training:
+
+      * **No rows are dropped.** Every ``(entity, t)`` drawn from the evolving
+        TIRP-prefix durations gets a feature row and therefore a forecast, even where
+        ``t + horizon`` has no covering target STI (a gap / the end of the entity's
+        data). Training drops those rows because they have no label; at inference we
+        still want the prediction and just mark it as having no ground truth.
+      * **Per-row metadata is returned alongside X** so Stage 4/5 can align each
+        forecast to its ``(EntityID, absolute t)``, evaluate against ground truth on
+        the covered rows, and later filter by test regime / ``cut_time`` and aggregate
+        across TIRPs.
+
+    :param durations_df: DataFrame ["EntityID", <duration cols...>, "TFS"], one row per instance.
+    :param target_stis: DataFrame [EntityID, StartTime, EndTime, StateID] of the forecast
+                        target variable only. For inference these come from the **Test** KL,
+                        supplying the ground-truth symbol at ``t + horizon``.
+    :param horizon: forecast lead time in TimeStamp units.
+    :return: (X, meta, feature_names)
+             X            : np.ndarray (n_rows, 2*D) integer feature matrix (no rows dropped)
+             meta         : DataFrame aligned row-for-row with X, columns
+                            [EntityID, current_time, TFS, y_true, covered] where
+                            ``current_time`` = absolute t, ``y_true`` = target StateID at
+                            ``t + horizon`` (meaningless where ``covered`` is False), and
+                            ``covered`` flags whether a target STI covered ``t + horizon``.
+             feature_names: list[str] length 2*D giving the column order of X
+                            (same names ``build_forecast_training_arrays`` emits).
+    """
+    entity_col = "EntityID"
+    time_cols = [c for c in durations_df.columns if c not in (entity_col, "TFS", "event_time")]
+    D = len(time_cols)
+
+    feature_names = []
+    for c in time_cols:
+        feature_names.append(f"{c}_Binary")
+        feature_names.append(f"{c}_Duration")
+
+    empty_meta = pd.DataFrame(
+        {"EntityID": [], "current_time": [], "TFS": [], "y_true": [], "covered": []}
+    )
+    if durations_df.empty or D == 0:
+        return (np.empty((0, 2 * D), dtype=np.int16), empty_meta, feature_names)
+
+    dur = np.round(durations_df[time_cols].to_numpy(dtype=np.float64))
+    ent = durations_df[entity_col].to_numpy()
+    tfs = durations_df["TFS"].to_numpy(dtype=np.float64)
+
+    with np.errstate(invalid="ignore"):
+        spans_int = np.nansum(dur, axis=1).astype(np.int64)
+    n = int(spans_int.sum() + len(durations_df))  # +1 row per instance (t = 0..span)
+
+    max_val = int(spans_int.max()) if len(spans_int) else 0
+    idtype = np.int16 if max_val <= np.iinfo(np.int16).max else np.int32
+
+    X = np.empty((n, 2 * D), dtype=idtype)
+    # Row-aligned metadata (no drop): entity, absolute current time, TFS, label, coverage.
+    ent_out = np.empty((n,), dtype=np.int64)
+    curtime_out = np.empty((n,), dtype=np.int64)
+    tfs_out = np.empty((n,), dtype=np.int64)
+    y_out = np.empty((n,), dtype=np.int64)
+    covered_out = np.zeros((n,), dtype=bool)
+
+    sti_index = _build_entity_sti_index(target_stis)
+
+    pos = 0
+    for r in range(len(durations_df)):
+        dv = dur[r]                       # (D,) float, may contain NaN
+        span = int(spans_int[r])
+        T = span + 1
+        t = np.arange(T)                  # relative timestamps 0..span
+
+        start_rel = np.empty(D, dtype=np.float64)
+        start_rel[0] = 0.0
+        if D > 1:
+            start_rel[1:] = np.cumsum(dv)[:-1]
+
+        with np.errstate(invalid="ignore"):
+            rel = t[:, None] - start_rel[None, :]   # (T, D); NaN where start_rel is NaN
+            observed = rel >= 0                     # (NaN >= 0) -> False
+            capped = np.minimum(rel, dv[None, :])   # np.minimum propagates NaN
+            progress = np.where(np.isnan(dv)[None, :], rel, capped)
+            progress = np.where(observed, progress, 0.0)
+
+        block = X[pos:pos + T]
+        block[:, 0::2] = observed                   # bool -> int (Binary)
+        block[:, 1::2] = np.rint(progress)          # whole values -> int (Duration)
+
+        # Absolute current time per row and the future label at t + horizon.
+        abstime = tfs[r] + t                        # TFS is a real instance time (never NaN)
+        taus = abstime + horizon                    # absolute future query times
+        states, covered = _lookup_states(sti_index.get(int(ent[r])), taus)
+
+        ent_out[pos:pos + T] = int(ent[r])
+        curtime_out[pos:pos + T] = np.rint(abstime).astype(np.int64)
+        tfs_out[pos:pos + T] = int(round(float(tfs[r])))
+        y_out[pos:pos + T] = states
+        covered_out[pos:pos + T] = covered
+        pos += T
+
+    meta = pd.DataFrame({
+        "EntityID": ent_out,
+        "current_time": curtime_out,
+        "TFS": tfs_out,
+        "y_true": y_out,
+        "covered": covered_out,
+    })
+    return X, meta, feature_names
+
+
 def build_fcp_model_tables(tirp, max_gap, event_symbol, epsilon=0, num_relations=7, tirp_detector=None, class1=False):
     """
     High-level wrapper for the FCPM step:
@@ -703,6 +964,60 @@ def run_test_table(file_path, max_gap, num_relations, epsilon, tirp_obj, event_s
     # final_feature_matrix.to_csv(feature_csv_path, index=False)
     # return final_feature_matrix
     return 1
+
+
+def build_forecast_durations(file_path, max_gap, num_relations, epsilon, tirp_obj,
+                             output_folder=None):
+    """
+    Build the per-instance TIEP-duration table for one TIRP, uniformly across all of
+    its evolving prefixes (MARIO forecasting: no event symbol, no class split, no TTE).
+
+    This is the event-free counterpart of ``run_test_table`` / ``run_build_tables``: it
+    runs the TIRP detector on ``file_path``, reveals the TIRP's prefixes, and extracts
+    each prefix's consecutive-TIEP durations via the SAME normal path FCPM used for its
+    ``class1`` case (``class1=True``), so the final/full prefix is treated like any other
+    -- there is no synthetic-event stitching on the last prefix and ``event_symbol`` is
+    never consulted. The per-prefix tables are merged with ``merge_prefix_tables`` into
+    one durations table (one row per detected instance; columns are the duration between
+    consecutive TIEPs, plus ``TFS`` = absolute time of the first TIEP).
+
+    :param file_path: KL time-intervals file (MARIO Stage 1 ``Train/KL.txt`` when training).
+    :param tirp_obj: a TIRP object (pass a ``.copy_tirp()`` -- detection mutates instances).
+    :param output_folder: if given, ``durations_merged_df.csv`` is written there.
+    :return: durations_merged_df (DataFrame ["EntityID", <dur cols...>, "TFS"]).
+    """
+    detector = TIRPDetector(
+        time_intervals_path=file_path,
+        num_relations=num_relations,
+        max_gap=max_gap,
+        epsilon=epsilon,
+        output_path="",
+        print_instances=False,
+        one_size_tirp=True,
+    )
+
+    # class1=True => every prefix (including the full TIRP) uses the normal duration
+    # path; event_symbol is unused there, so pass None.
+    prefix_durations_map = build_fcp_model_tables(
+        tirp_obj, tirp_detector=detector, max_gap=max_gap, event_symbol=None,
+        num_relations=num_relations, epsilon=epsilon, class1=True,
+    )
+
+    df_list = list(prefix_durations_map.values())
+    if len(df_list) >= 2:
+        # merge_prefix_tables intentionally drops the first (shortest) prefix table,
+        # matching FCPM's durations construction that MARIO reuses unchanged.
+        merged_df = merge_prefix_tables(df_list)
+    elif len(df_list) == 1:
+        merged_df = df_list[0]
+    else:
+        merged_df = pd.DataFrame(columns=["EntityID", "TFS"])
+
+    if output_folder is not None:
+        os.makedirs(output_folder, exist_ok=True)
+        merged_df.to_csv(os.path.join(output_folder, "durations_merged_df.csv"), index=False)
+
+    return merged_df
 
 
 
