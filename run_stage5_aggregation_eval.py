@@ -1,233 +1,341 @@
+"""
+Stage 5 (MARIO forecasting): cross-TIRP aggregation + forecast evaluation.
+
+This is the MARIO rewrite of the old FCPM ROC/TTE aggregation. It consumes the
+per-TIRP forecasts written by Stage 4 (`tirp_<id>/forecasts.csv.gz`, each row a
+`(EntityID, current_time)` with a `P_<symbol>` probability distribution) and
+collapses them into ONE forecast per `(entity, t)`:
+
+  1. Active set. A TIRP is "active" at timestamp t for an entity if it produced a
+     forecast row there. Stage 4 emits a row for every integer t a TIRP prefix
+     instance spans, so "has a row at t" == "prefix active at t". With
+     `context_window = C > 0` a TIRP also counts as active at t if its most recent
+     row falls in [t - C, t] (a grace period after the pattern completes); its
+     contribution is then that most-recent in-window distribution.
+  2. Symbol alignment. Each Stage 3 model only predicts the target symbols it saw
+     in training, so different TIRPs have different `P_<symbol>` columns. Every
+     TIRP's distribution is reindexed to the global union of symbols, filling
+     missing symbols with 0.0 (the model assigns them zero probability). Each row
+     therefore still sums to 1.
+  3. Aggregation. The active TIRPs' distributions are combined per symbol
+     (default: unweighted average) and the argmax is the forecast symbol.
+  4. Evaluation. Only rows with valid ground truth (`covered`) are scored, and
+     only those inside the test region per the Stage 0 split manifest:
+     `seen_future` entities are scored where `current_time > cut_time`;
+     `new_entity` (holdout) entities are scored across their timeline (after an
+     optional per-entity `warmup`). Multiclass accuracy / macro-F1 / weighted-F1 /
+     log-loss are reported overall and per regime against a majority baseline.
+
+Outputs (into results_output_dir):
+    aggregated_forecasts.csv.gz   # one row per (entity, t): aggregated P_<symbol>,
+                                  #   pred_symbol, y_true, covered, regime, scored
+    stage5_metrics.csv            # one row per scope (overall / seen_future / new_entity)
+    stage5_aggregation.done       # resumability marker
+"""
+
 import os
-import argparse
 import sys
+import glob
+import argparse
 import time
-import csv # For CSV file operations
 
-# --- Assume necessary imports succeed ---
-# Adjust paths based on your project structure
-try:
-    from FCPM_Package.aggregation_class import Aggregation
-    from FCPM_Package.Evaluate import Evaluate
-except ImportError as e:
-    print(f"ERROR: Failed to import Aggregation or Evaluate from FCPM_Package: {e}")
-    print("Please ensure FCPM_Package is installed and accessible.")
-    sys.exit(1)
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score, f1_score, log_loss
 
-# --- Main Aggregation & Evaluation Function (Simplified) ---
 
-def run_single_aggregation_evaluation(
-    aggregation_method, num_tirps_for_selection, tirp_selection_method, 
-    tte_w_list, e_w_list,
-    tirp_models_base_dir, results_output_dir, # Directory for the ROC CSVs of this specific run
-    dataset_name, fold_num, abs_d_method, abs_b, abs_ig, abs_split_event_class, abs_event_window, # Additional parameters from args
-    mine_mvs, mine_mg, mine_rel, mine_sf, mine_e,      # Additional parameters from args
-    general_results_summary_dir,                        # Directory for the overall summary CSV file
-    model_type                                          # The model nickname
-):
+# --- Loading -----------------------------------------------------------------
+
+def load_all_forecasts(prediction_output_dir):
     """
-    Executes the aggregation and evaluation process for a specific aggregation method and TIRP selection method.
+    Read every `tirp_<id>/forecasts.csv.gz` under prediction_output_dir.
 
-    Parameters:
-        aggregation_method (str): Method name for aggregation.
-        num_tirps_for_selection: Number of TIRPs to select for aggregation.
-        tirp_selection_method (str): TIRP selection method to use.
-        tte_w_list (list): List of TTE window sizes to process serially.
-        e_w_list (list): List of early warning values to process serially.
-        tirp_models_base_dir (str): Directory containing all TIRP model prediction outputs (Stage 3 outputs).
-        results_output_dir (str): Directory where the final evaluation result CSVs for the current run will be saved.
-        dataset_name (str): Name of the dataset.
-        fold_num (int): Fold number.
-        abs_d_method (str): Abstraction discretization method.
-        abs_b (int): Number of bins for abstraction.
-        abs_ig (int): Interpolation gap for abstraction.
-        abs_split_event_class (str): Whether to split data based on event class.
-        abs_event_window (str): Window size for event/class split.
-        mine_mvs (float): Mining minimum vertical support.
-        mine_mg (int): Mining max gap.
-        mine_rel (int): Mining number of relations.
-        mine_sf (bool): Mining skip followers.
-        mine_e (int): Mining epsilon.
-        general_results_summary_dir (str): Directory where the summary CSV of all experiments will be saved.
-        model_type (str): the model type (FCPM/CPML).
+    Returns (forecasts, symbols):
+      forecasts : long DataFrame [tirp_id, EntityID, current_time, y_true,
+                  covered, P_<symbol>...] with each TIRP's P-columns reindexed to
+                  the global symbol union (missing symbols filled 0.0).
+      symbols   : sorted list[int] of all target symbols seen across TIRPs.
+    A TIRP whose Stage 4 run produced no rows (empty forecasts) is skipped.
     """
-    print(f"--- Starting Stage 5: Aggregation & Evaluation ---")
-    print(f"Method: {aggregation_method}, TIRP Selection: {tirp_selection_method}")
-    print(f"TTE Windows: {tte_w_list}, Early Warning: {e_w_list}")
-    print(f"Input (Prediction Dirs): {tirp_models_base_dir}")
-    print(f"Output (ROC CSVs Dir for this run): {results_output_dir}")
-    print(f"Summary CSV Dir: {general_results_summary_dir}")
-    start_total_time = time.time()
+    paths = sorted(glob.glob(os.path.join(prediction_output_dir, "tirp_*", "forecasts.csv.gz")))
+    if not paths:
+        print(f"ERROR: No 'tirp_*/forecasts.csv.gz' found under {prediction_output_dir}.")
+        sys.exit(1)
 
-    # --- Step 1: Aggregate Predictions (Once per TIRP selection method) ---
-    print(f"Step 1: Aggregating predictions using method '{aggregation_method}' with TIRP selection '{tirp_selection_method}'...")
-    
-    start_agg_time = time.time()
-    base_dir = os.path.dirname(tirp_models_base_dir)
-    tirp_scoring_file_path = os.path.join(base_dir, 'tirp_selection_scores.csv')
+    frames = []
+    symbols = set()
+    for p in paths:
+        df = pd.read_csv(p)
+        if df.empty:
+            continue
+        tirp_id = os.path.basename(os.path.dirname(p))[len("tirp_"):]
+        df["tirp_id"] = tirp_id
+        frames.append(df)
+        symbols.update(int(c[len("P_"):]) for c in df.columns if c.startswith("P_"))
 
-    # Ensure the directory for the summary CSV exists
-    os.makedirs(general_results_summary_dir, exist_ok=True)
+    if not frames:
+        print(f"ERROR: All forecast files under {prediction_output_dir} were empty.")
+        sys.exit(1)
 
-    if tirp_selection_method == 'all':
-        # If 'all', no need to specify number of TIRPs, just use the method name
-        tirp_selection_method_name = f'Binary_{tirp_selection_method}'
+    symbols = sorted(symbols)
+    prob_cols = [f"P_{s}" for s in symbols]
+    meta_cols = ["tirp_id", "EntityID", "current_time", "y_true", "covered"]
+
+    aligned = []
+    for df in frames:
+        # Reindex to the global symbol set; symbols this model never saw -> 0 prob.
+        for c in prob_cols:
+            if c not in df.columns:
+                df[c] = 0.0
+        aligned.append(df[meta_cols + prob_cols])
+
+    forecasts = pd.concat(aligned, ignore_index=True)
+    forecasts["EntityID"] = forecasts["EntityID"].astype(int)
+    forecasts["current_time"] = forecasts["current_time"].astype(int)
+    forecasts["y_true"] = forecasts["y_true"].astype(int)
+    forecasts["covered"] = forecasts["covered"].astype(bool)
+    print(f"Loaded {len(paths)} TIRP forecast file(s), {len(forecasts)} rows, "
+          f"{len(symbols)} target symbols {symbols}.")
+    return forecasts, symbols
+
+
+# --- Aggregation -------------------------------------------------------------
+
+def aggregate_forecasts(forecasts, symbols, context_window=0, method="average"):
+    """
+    Collapse per-TIRP forecasts into one distribution per (EntityID, current_time).
+
+    Steps:
+      * Reduce overlapping instances of the SAME TIRP at the same (entity, t) to a
+        single distribution (mean), so each TIRP contributes at most one vote per t.
+      * Combine the active TIRPs' distributions per symbol:
+          - 'average': unweighted mean across active TIRPs.
+          - 'max':     per-symbol maximum across active TIRPs (then renormalised).
+        where "active at t" is:
+          - context_window == 0: all TIRPs with a row exactly at t (== all TIRPs
+            whose prefix spans t).
+          - context_window  > 0: for each evaluation point t (drawn from the union
+            of exact rows) and each TIRP, that TIRP's most-recent row with
+            current_time in [t - context_window, t] (merge_asof backward).
+      * argmax over the aggregated distribution -> pred_symbol.
+
+    Returns a DataFrame [EntityID, current_time, y_true, covered, n_active_tirps,
+    P_<symbol>..., pred_symbol].
+    """
+    if method not in ("average", "max"):
+        raise ValueError(f"Unsupported aggregation method '{method}' (expected 'average' or 'max').")
+
+    prob_cols = [f"P_{s}" for s in symbols]
+
+    # Per-TIRP reduction: mean distribution when a TIRP has several instances at t.
+    reduced = (
+        forecasts.groupby(["tirp_id", "EntityID", "current_time"], as_index=False)[prob_cols].mean()
+    )
+
+    # Ground truth is a property of (EntityID, current_time), identical across TIRPs.
+    truth = (
+        forecasts.groupby(["EntityID", "current_time"], as_index=False)
+        .agg(y_true=("y_true", "first"), covered=("covered", "first"))
+    )
+
+    if context_window == 0:
+        grp = reduced.groupby(["EntityID", "current_time"])
+        combined = grp[prob_cols].mean() if method == "average" else grp[prob_cols].max()
+        agg = combined.reset_index()
+        agg["n_active_tirps"] = grp.size().values
     else:
-        # For other methods, include the number of TIRPs to select
-        tirp_selection_method_name = f'Binary_{tirp_selection_method}#{num_tirps_for_selection}'
-    print(f"Processing TIRP selection method: {tirp_selection_method_name}")
+        # Evaluation grid = every (entity, t) that any TIRP forecast exactly.
+        # merge_asof needs the `on` key (current_time) globally sorted, so we sort
+        # by current_time (EntityID is handled via `by=`) and keep this row order
+        # as canonical for the accumulator arrays below.
+        grid = (
+            reduced[["EntityID", "current_time"]]
+            .drop_duplicates()
+            .sort_values(["current_time", "EntityID"])
+            .reset_index(drop=True)
+        )
+        acc = np.zeros((len(grid), len(prob_cols)), dtype=np.float64)
+        active = np.zeros(len(grid), dtype=np.int64)
+        for _, right in reduced.groupby("tirp_id"):
+            right = right.sort_values(["current_time", "EntityID"])
+            m = pd.merge_asof(
+                grid, right[["EntityID", "current_time"] + prob_cols],
+                by="EntityID", on="current_time",
+                direction="backward", tolerance=int(context_window),
+            )
+            vals = m[prob_cols].to_numpy(dtype=np.float64)
+            hit = ~np.isnan(vals).any(axis=1)   # this TIRP had an in-window row
+            if method == "average":
+                acc[hit] += vals[hit]
+            else:  # max: probabilities are >= 0, so 0-init is a valid lower bound
+                acc[hit] = np.maximum(acc[hit], vals[hit])
+            active += hit
+        agg = grid.copy()
+        agg[prob_cols] = acc / active[:, None] if method == "average" else acc  # active >= 1
+        agg["n_active_tirps"] = active
 
-    aggregation = Aggregation(
-        method_name=aggregation_method,
-        prediction_output_dir=tirp_models_base_dir,
-        tirp_selection_method = tirp_selection_method_name,
-        scores_file_path=tirp_scoring_file_path
-    )
-    # aggregate_predictions() should return the base name or relevant identifier for the aggregated file
-    base_file_name_for_eval = aggregation.aggregate_predictions() 
-    end_agg_time = time.time()
-    print(f"Aggregation for {tirp_selection_method_name} finished. Time: {end_agg_time - start_agg_time:.2f} seconds.")
-# --- Step 2: Evaluate Aggregated Results (Loop over TTE_W and e_w combinations) ---
-    print(f"Step 2: Evaluating aggregated predictions (ROC) for all TTE_W and e_w combinations in memory...")
-    
-    os.makedirs(results_output_dir, exist_ok=True) 
-    
-    start_eval_time = time.time()
+    # Renormalize each aggregated row to sum to exactly 1. For 'average' this only
+    # removes the ~1e-7 float drift XGBoost's softprob carries (which otherwise
+    # trips log_loss); for 'max' it is a real renormalisation into a distribution.
+    row_sums = agg[prob_cols].sum(axis=1)
+    agg[prob_cols] = agg[prob_cols].div(row_sums, axis=0)
 
-    # Create the prefix exactly as the original filename format requires
-    base_result_name = f'{model_type}_ts_{tirp_selection_method}_agg_{aggregation_method}'
+    agg = agg.merge(truth, on=["EntityID", "current_time"], how="left")
+    agg["pred_symbol"] = np.asarray(symbols)[agg[prob_cols].to_numpy().argmax(axis=1)]
 
-    # Initialize Evaluate once per execution
-    evaluation = Evaluate(
-        prediction_output_dir=tirp_models_base_dir, 
-        agg_method=aggregation_method,
-        agg_file_name=base_file_name_for_eval
-    )
-    
-    # Run the optimized evaluation (this generates ALL csv files, plots, and thresholds)
-    results_dict = evaluation.evaluate_roc(
-        tte_w_list=tte_w_list,
-        e_w_list=e_w_list,
-        output_dir=results_output_dir,
-        base_result_name=base_result_name
-    )
+    ordered = ["EntityID", "current_time", "y_true", "covered", "n_active_tirps"] + prob_cols + ["pred_symbol"]
+    return agg[ordered].sort_values(["EntityID", "current_time"]).reset_index(drop=True)
 
-    end_eval_time = time.time()
-    print(f"  Evaluation finished for all parameters. Time: {end_eval_time - start_eval_time:.2f} seconds.")
 
-    # --- Save experiment parameters to summary CSV ---
-    summary_csv_file_path = os.path.join(general_results_summary_dir, f"fold_num_{fold_num}_abs_{abs_d_method}_{abs_b}_{abs_ig}_KL_{mine_mvs}_{mine_mg}_{mine_rel}_{mine_sf}_{mine_e}_{model_type}_agg_{aggregation_method}_{tirp_selection_method}#{num_tirps_for_selection}.csv")
-    
-    file_exists = os.path.isfile(summary_csv_file_path)
-    
-    with open(summary_csv_file_path, 'a', newline='', encoding='utf-8') as csvfile:
-        for TTE_window_size in tte_w_list:
-            for early_warning_value in e_w_list:
-                # Retrieve the specific AUC and AUPRC for this combination
-                AUC, AUPRC = results_dict.get((TTE_window_size, early_warning_value), (0.0, 0.0))
+# --- Regime filtering --------------------------------------------------------
 
-                experiment_data_row = {
-                    'dataset_name': dataset_name,
-                    'fold_num': fold_num,
-                    'abs_method': abs_d_method,
-                    'bins': abs_b,
-                    'abs_ig': abs_ig,
-                    # 'split_event_class': abs_split_event_class,
-                    # 'event_window': abs_event_window,
-                    'KL_mvs': mine_mvs,
-                    'KL_mg': mine_mg,
-                    'KL_num_rel': mine_rel,
-                    'KL_sf': mine_sf,
-                    'KL_e': mine_e,
-                    'model_type': model_type,
-                    'agg_method': aggregation_method,
-                    'tirp_selection_method': tirp_selection_method,
-                    'num_tirps_for_selection': num_tirps_for_selection,
-                    'TTE_WS': TTE_window_size,
-                    'early_warning': early_warning_value,
-                    'AUC': AUC,
-                    'AUPRC': AUPRC,
-                }
-                
-                fieldnames = list(experiment_data_row.keys())
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                if not file_exists:
-                    writer.writeheader()
-                    file_exists = True # Ensure header is written only once
-                
-                writer.writerow(experiment_data_row)
-                print(f"  Experiment parameters for TTE_W={TTE_window_size}, e_w={early_warning_value} appended to {summary_csv_file_path}")
+def attach_regime_and_filter(agg, manifest, warmup=0):
+    """
+    Attach the Stage 0 test regime to each aggregated row and flag which rows are
+    scored. Adds columns: test_regime, cut_time, scored.
 
-    end_total_time = time.time()
-    print(f"--- Finished Stage 5: Aggregation & Evaluation. Total Time: {end_total_time - start_total_time:.2f} seconds ---")
+      * seen_future (train entities): scored where current_time > cut_time -- only
+        the revealed-future slice, never the training history.
+      * new_entity (holdout entities): scored across the timeline once past a
+        per-entity warm-up (current_time >= first_forecast_time + warmup).
+
+    Rows whose entity is absent from the manifest are marked scored=False.
+    """
+    m = manifest[["EntityID", "test_regime", "cut_time"]].copy()
+    m["EntityID"] = m["EntityID"].astype(int)
+    out = agg.merge(m, on="EntityID", how="left")
+
+    first_time = out.groupby("EntityID")["current_time"].transform("min")
+    is_seen = out["test_regime"] == "seen_future"
+    is_new = out["test_regime"] == "new_entity"
+
+    scored = pd.Series(False, index=out.index)
+    scored |= is_seen & out["cut_time"].notna() & (out["current_time"] > out["cut_time"])
+    scored |= is_new & (out["current_time"] >= first_time + warmup)
+    out["scored"] = scored & out["covered"].astype(bool)
+    return out
+
+
+# --- Evaluation --------------------------------------------------------------
+
+def _metrics_for(subset, symbols):
+    """Multiclass metrics + majority baseline for one scored subset."""
+    prob_cols = [f"P_{s}" for s in symbols]
+    y = subset["y_true"].to_numpy()
+    pred = subset["pred_symbol"].to_numpy()
+    n = len(subset)
+
+    counts = subset["y_true"].value_counts()
+    majority_class = int(counts.index[0])
+    majority_baseline_acc = float(counts.iloc[0] / n)
+
+    # log-loss needs y_true to be among the probability columns' symbols.
+    in_vocab = subset["y_true"].isin(symbols)
+    if in_vocab.any():
+        ll = float(log_loss(
+            subset.loc[in_vocab, "y_true"].to_numpy(),
+            subset.loc[in_vocab, prob_cols].to_numpy(),
+            labels=symbols,
+        ))
+    else:
+        ll = float("nan")
+
+    return {
+        "n": n,
+        "accuracy": float(accuracy_score(y, pred)),
+        "macro_f1": float(f1_score(y, pred, average="macro", labels=symbols, zero_division=0)),
+        "weighted_f1": float(f1_score(y, pred, average="weighted", labels=symbols, zero_division=0)),
+        "log_loss": ll,
+        "majority_class": majority_class,
+        "majority_baseline_acc": majority_baseline_acc,
+        "beats_baseline": bool(accuracy_score(y, pred) > majority_baseline_acc),
+    }
+
+
+def evaluate(scored_agg, symbols):
+    """
+    Metrics for the scored rows overall and per regime.
+    Returns a DataFrame, one row per scope.
+    """
+    scored = scored_agg[scored_agg["scored"]]
+    rows = []
+    if len(scored):
+        rows.append({"scope": "overall", **_metrics_for(scored, symbols)})
+    for regime in ["seen_future", "new_entity"]:
+        sub = scored[scored["test_regime"] == regime]
+        if len(sub):
+            rows.append({"scope": regime, **_metrics_for(sub, symbols)})
+    if not rows:
+        print("WARNING: no scored rows to evaluate (check manifest / cut_time / warmup).")
+    return pd.DataFrame(rows)
+
+
+# --- Orchestration -----------------------------------------------------------
+
+def run_single_aggregation_evaluation(prediction_output_dir, split_manifest_path,
+                                      results_output_dir, aggregation_method="average",
+                                      context_window=0, warmup=0):
+    print("--- Starting Stage 5: Aggregation & Forecast Evaluation (MARIO) ---")
+    print(f"Predictions dir : {prediction_output_dir}")
+    print(f"Split manifest  : {split_manifest_path}")
+    print(f"Results dir     : {results_output_dir}")
+    print(f"Aggregation     : {aggregation_method} | context_window={context_window} | warmup={warmup}")
+    t0 = time.time()
+
+    if not os.path.exists(split_manifest_path):
+        print(f"ERROR: Split manifest not found at {split_manifest_path}")
+        sys.exit(1)
+    manifest = pd.read_csv(split_manifest_path)
+
+    forecasts, symbols = load_all_forecasts(prediction_output_dir)
+    agg = aggregate_forecasts(forecasts, symbols, context_window=context_window,
+                              method=aggregation_method)
+    agg = attach_regime_and_filter(agg, manifest, warmup=warmup)
+    metrics = evaluate(agg, symbols)
+
+    os.makedirs(results_output_dir, exist_ok=True)
+    agg_path = os.path.join(results_output_dir, "aggregated_forecasts.csv.gz")
+    agg.to_csv(agg_path, index=False, compression="gzip")
+    metrics_path = os.path.join(results_output_dir, "stage5_metrics.csv")
+    metrics.to_csv(metrics_path, index=False)
+
+    print(f"\nAggregated {len(agg)} (entity, t) forecasts -> {agg_path}")
+    print(f"Scored {int(agg['scored'].sum())} rows. Metrics -> {metrics_path}")
+    if len(metrics):
+        print(metrics.to_string(index=False))
+
+    done_path = os.path.join(results_output_dir, "stage5_aggregation.done")
+    with open(done_path, "w") as f:
+        f.write("done")
+    print(f"\n--- Finished Stage 5 in {time.time() - t0:.2f}s ---")
+    return metrics
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 4: Run aggregation and evaluation for TIRP model predictions (Simplified).")
-
-    # General Info
-    parser.add_argument("--dataset_name", required=True, help="Name of the dataset.")
-    parser.add_argument("--fold_num", required=True, type=int, help="Fold number for cross-validation.")
-
-    # Abstraction Params
-    parser.add_argument("--abs_d_method", required=True, help="Abstraction discretization method (e.g., SAX, KMEANS).")
-    parser.add_argument("--abs_b", required=True, type=int, help="Number of bins for abstraction.")
-    parser.add_argument("--abs_ig", required=True, type=int, help="Interpolation gap for abstraction.")
-    parser.add_argument("--abs_split_event_class", type=str, default="False", help="Whether to split data based on event class.")
-    parser.add_argument("--abs_event_window", type=str, default="None", help="Window size for event/class split.")
-
-    # Mining Params
-    parser.add_argument("--mine_mvs", required=True, type=float, help="Minimum vertical support for mining TIRPs.")
-    parser.add_argument("--mine_mg", required=True, type=int, help="Maximum gap allowed between symbols in a TIRP.")
-    parser.add_argument("--mine_rel", required=True, type=int, help="Number of Allen's relations to consider.")
-    parser.add_argument("--mine_sf", required=True, type=lambda x: (str(x).lower() == 'true'), help="Skip followers during mining (True/False).")
-    parser.add_argument("--mine_e", required=True, type=int, help="Epsilon for temporal constraint satisfaction.")
-
-    # Aggregation/Eval Params
-    parser.add_argument("--agg_aggregation_method", required=True, help="Method for aggregating predictions (e.g., AVG, MAX).")
-    parser.add_argument("--agg_num_tirps_for_selection", required=True, type=int, help="Number of TIRPs to select for aggregation.")
-    
-    # TIRP Selection Method
-    parser.add_argument("--tirp_selection_method", required=True, help="TIRP selection method to use.")
-    
-    # TTE and Early Warning Lists (comma-separated)
-    parser.add_argument("--TTE_W_list", required=True, help="Comma-separated list of TTE window sizes.")
-    parser.add_argument("--e_w_list", required=True, help="Comma-separated list of early warning values.")
-    parser.add_argument("--model_type", required=True, help="Nickname of the model (FCPM/CPML).")
-
-    # Paths
-    parser.add_argument("--prediction_base_dir", required=True, help="Base directory containing Stage 3 (TIRP model) prediction outputs.")
-    parser.add_argument("--output_csv_path", required=True, help="Directory to save the output ROC CSVs for this specific run.")
-    parser.add_argument("--results_dir", required=True, help="Directory to save the general experiment summary CSV.")
-
+    parser = argparse.ArgumentParser(
+        description="Stage 5 (MARIO): cross-TIRP forecast aggregation + evaluation."
+    )
+    parser.add_argument("--prediction_output_dir", required=True,
+                        help="Dir holding Stage 4 'tirp_<id>/forecasts.csv.gz' files.")
+    parser.add_argument("--split_manifest_path", required=True,
+                        help="Stage 0 'split_manifest.csv' (EntityID, role, test_regime, cut_time).")
+    parser.add_argument("--results_output_dir", required=True,
+                        help="Dir to write aggregated_forecasts.csv.gz + stage5_metrics.csv.")
+    parser.add_argument("--aggregation_method", default="average",
+                        help="Cross-TIRP aggregation function: 'average' or 'max'.")
+    parser.add_argument("--context_window", type=int, default=0,
+                        help="Grace window C: a TIRP is active at t if its most recent "
+                             "forecast falls in [t-C, t]. 0 = exact (prefix spans t).")
+    parser.add_argument("--warmup", type=int, default=0,
+                        help="Per-entity warm-up (time units) before new_entity rows are scored.")
     args = parser.parse_args()
 
-    # Parse the comma-separated lists
-    tte_w_list = [int(x.strip()) for x in args.TTE_W_list.split(',') if x.strip()]
-    e_w_list = [int(x.strip()) for x in args.e_w_list.split(',') if x.strip()]
-
     run_single_aggregation_evaluation(
-        aggregation_method=args.agg_aggregation_method,
-        num_tirps_for_selection=args.agg_num_tirps_for_selection,
-        tirp_selection_method=args.tirp_selection_method,
-        tte_w_list=tte_w_list,
-        e_w_list=e_w_list,
-        tirp_models_base_dir=args.prediction_base_dir,
-        results_output_dir=args.output_csv_path, # Directory for specific ROC CSVs
-        dataset_name=args.dataset_name,
-        fold_num=args.fold_num,
-        abs_d_method=args.abs_d_method,
-        abs_b=args.abs_b,
-        abs_ig=args.abs_ig,
-        abs_split_event_class=args.abs_split_event_class,
-        abs_event_window=args.abs_event_window,
-        mine_mvs=args.mine_mvs,
-        mine_mg=args.mine_mg,
-        mine_rel=args.mine_rel,
-        mine_sf=args.mine_sf,
-        mine_e=args.mine_e,
-        general_results_summary_dir=args.results_dir, # Directory for the overall summary CSV
-        model_type=args.model_type
+        prediction_output_dir=args.prediction_output_dir,
+        split_manifest_path=args.split_manifest_path,
+        results_output_dir=args.results_output_dir,
+        aggregation_method=args.aggregation_method,
+        context_window=args.context_window,
+        warmup=args.warmup,
     )
-
     sys.exit(0)

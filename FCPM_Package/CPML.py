@@ -7,21 +7,24 @@ class CPML:
     def __init__(self, **xgb_kwargs):
         """
         Initializes the CPML wrapper using XGBoost.
-        Acts exactly like the FCPM class for continuous prediction.
+
+        The objective is left for XGBoost to infer from the labels, so the same class
+        serves FCPM's binary event target (2 classes -> binary:logistic) and MARIO's
+        forecast target (the categorical symbol at t+HORIZON -> multi:softprob over the
+        target variable's states). After fitting, ``classes_`` holds the label order
+        matching the columns of ``predict_proba`` (needed to map a probability column
+        back to its forecast symbol downstream).
         """
         self.feature_columns = None
-        
-        # Use XGBClassifier configured to output probabilities
-        # 'binary:logistic' ensures the output is a probability between 0 and 1
-        self.ml_model = XGBClassifier(
-            objective='binary:logistic',
-            eval_metric='logloss',
-            **xgb_kwargs
-        )
-        
+        self.classes_ = None
+
+        # No forced objective/eval_metric: XGBClassifier picks binary vs multiclass
+        # from the number of distinct labels in y.
+        self.ml_model = XGBClassifier(**xgb_kwargs)
+
         # Columns that are metadata and should NOT be used as ML features.
         self.metadata_cols = [
-            'EntityID', 'instance_ID', 'instance_start_time', 'TFS', 
+            'EntityID', 'instance_ID', 'instance_start_time', 'TFS',
             'current_time', 'outcome_class', 'event_time', 'TTE'
         ]
 
@@ -55,11 +58,27 @@ class CPML:
         :param feature_names: ordered list of the columns in X (stored for prediction).
         """
         self.feature_columns = list(feature_names)
-        self.ml_model.fit(X, y)
+        # XGBoost requires contiguous 0..K-1 labels, but MARIO's y holds arbitrary
+        # target StateIDs (e.g. 35..39). Encode to 0..K-1 for fitting and keep the real
+        # symbol ids in classes_ (sorted), so predict_proba_matrix column j maps back to
+        # classes_[j].
+        self.classes_, y_encoded = np.unique(y, return_inverse=True)
+        self.ml_model.fit(X, y_encoded)
         logging.info(
             f"CPML model trained from array with {len(self.feature_columns)} features, "
-            f"{X.shape[0]} rows."
+            f"{X.shape[0]} rows, {0 if self.classes_ is None else len(self.classes_)} classes."
         )
+
+    def predict_proba_matrix(self, X):
+        """
+        Return the full class-probability matrix for a compact NumPy feature matrix,
+        aligned to ``self.classes_`` (column j is the probability of ``classes_[j]``).
+
+        This is the MARIO-forecast prediction primitive (per (entity, t) row -> a
+        distribution over the target variable's symbols). The binary-specific
+        ``predict`` above stays for the FCPM event path.
+        """
+        return self.ml_model.predict_proba(X)
 
     def predict(self, timestamp, entity_id, df_per_timestamp, epsilon=None):
         """

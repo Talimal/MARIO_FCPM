@@ -28,6 +28,16 @@ DEFAULT_HORIZON = 1
 # the range to drop rare (low VS) or ubiquitous/uninformative (high VS) TIRPs.
 TIRP_VS_MIN = 0.0
 TIRP_VS_MAX = 1.0
+
+# --- MARIO cross-TIRP aggregation (Stage 5) ---
+# How the per-TIRP forecast distributions are combined into one forecast per
+# (entity, t): currently only unweighted 'average'.
+STAGE5_AGGREGATION_METHOD = "average"
+# Grace window C (TimeStamp units): a TIRP counts as active at t if its most
+# recent forecast falls in [t - C, t]. 0 = exact (the prefix must span t).
+STAGE5_CONTEXT_WINDOW = 0
+# Per-entity warm-up before new_entity (holdout) rows are scored.
+STAGE5_WARMUP = 0
 DEFAULT_EVENT_SYMBOL = 999  # Default event symbol if not specified per dataset
 BUILD_CPML = True  # Flag to build and evaluate the CPML model
 RUN_STAGE3_5_VALIDATION = False # Make Stage 3.5 optional
@@ -41,7 +51,7 @@ SUPPORTING_ENTITIES_ONLY = True
 # Max number of TIRPs to consider in Stage 2 Tirp_selection (e.g., after sorting by some criteria)
 # Set to -1 or None for no limit by default
 MAX_TIRPS_FOR_SELECTION = [20] #
-SKIP_SAME_VARIABLE = True
+SKIP_SAME_VARIABLE = False
 
 # --- Stage 1: Knowledge-Based and Gradient Configuration ---
 # These are static configuration values for KB and gradient methods
@@ -104,7 +114,7 @@ WRAPPER_SCRIPT_PATHS = {
     2: "run_stage2_mining.py",
     3: "run_stage3_build_model.py",        # Builds model only
     3.5: "run_stage3_5_validation.py",     # Validates FCPM model
-    4: "run_stage4_predict_entities.py",   # New prediction per entity batch script
+    4: "run_stage4_predict_entities.py",   # MARIO Stage 4: forecast on TEST set, batched by TIRP
     5: "run_stage5_aggregation_eval.py",    # Original stage 4 (aggregation) renamed
     "cleanup": "run_cleanup_fold.py"        # Cleanup script
 }

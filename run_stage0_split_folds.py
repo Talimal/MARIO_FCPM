@@ -85,14 +85,18 @@ def split_dataset_forecasting(dataset_name, data_path, horizon,
             print("ERROR: No time column found (expected 'TimeStamp' or 'Time').")
             sys.exit(1)
 
-        # Class rows (TemporalPropertyID == -1) are per-entity classification
-        # labels, not measurements. They are irrelevant to forecasting but are
-        # carried through untouched (Hugobot drops them for unsupervised methods).
-        # They must be excluded from the chronological cut computation.
+        # Drop class rows (TemporalPropertyID == -1). These are per-entity
+        # classification labels from the original FCPM dataset and have no role
+        # in forecasting. Removing them here keeps the rest of the pipeline
+        # class-free: Hugobot never sees a class map, so no per-class KL files
+        # are produced downstream.
         if 'TemporalPropertyID' in data.columns:
-            is_measurement = data['TemporalPropertyID'] != -1
-        else:
-            is_measurement = pd.Series(True, index=data.index)
+            n_before = len(data)
+            data = data[data['TemporalPropertyID'] != -1]
+            n_dropped = n_before - len(data)
+            if n_dropped:
+                print(f"Dropped {n_dropped} class-label rows "
+                      f"(TemporalPropertyID == -1); forecasting has no classes.")
 
         # --- Entity axis: seeded holdout partition ---
         # Sort entity ids first so the permutation is independent of row order.
@@ -111,8 +115,8 @@ def split_dataset_forecasting(dataset_name, data_path, horizon,
               f"{len(holdout_entities)} holdout")
 
         # --- Time axis: per-train-entity chronological cut ---
-        # cut_time = t_min + ratio * (t_max - t_min), over measurement rows only.
-        train_measure = data[is_measurement & data['EntityID'].isin(train_entities)]
+        # cut_time = t_min + ratio * (t_max - t_min).
+        train_measure = data[data['EntityID'].isin(train_entities)]
         t_min = train_measure.groupby('EntityID')[time_col].min()
         t_max = train_measure.groupby('EntityID')[time_col].max()
         cut_time = t_min + chrono_split_ratio * (t_max - t_min)
@@ -120,7 +124,6 @@ def split_dataset_forecasting(dataset_name, data_path, horizon,
 
         # Train rows: train entities, keep only rows whose target (t + horizon)
         # stays within the pre-cut region -> TimeStamp <= cut_time - horizon.
-        # Class rows (TimeStamp 0) pass this filter and stay with the train slice.
         train_mask = data['EntityID'].isin(train_entities) & (
             data[time_col] <= data['EntityID'].map(cut_map) - horizon
         )

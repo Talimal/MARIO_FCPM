@@ -67,11 +67,10 @@ datasets_to_run = [
         "sf": [True], # skip_followers used in submit_stage2_job
         "e": [0], # epsilon used in submit_stage2_job / submit_stage3_job
 
-        # Stage 4: Aggregation/Evaluation parameters
-        "aggregation_method": ['weighted_avg','max','avg'],
-        "num_tirps_for_selection": MAX_TIRPS_FOR_SELECTION, # Number of TIRPs to consider in Stage 2 Tirp_selection
-        "TTE_W": [10000], # TTE_window_size used in submit_stage4_job
-        "e_w": [0] # early_warning_value used in submit_stage4_job
+        # Stage 5: MARIO cross-TIRP aggregation hyperparameter grid (Cartesian product).
+        "aggregation_method": ['average','max'],  # how active TIRPs' distributions are combined
+        "context_window": [0, 5],                 # a TIRP is active at t if its last row is in [t-C, t]
+        "warmup": [0],                            # per-entity warm-up before new_entity rows are scored
     },
     # {
     #     'dataset_name': 'icu',

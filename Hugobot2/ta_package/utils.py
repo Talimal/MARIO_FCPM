@@ -705,7 +705,9 @@ def map_states_to_test_composite(test_df, states_list, method_config, output_dir
     
     save_results(entity_class, output_dir, df, states_df, max_gap)
 
-    df = df.drop(columns=['EntityClass'])
+    # EntityClass is only added by save_results when class labels are present.
+    # Forecasting has no classes, so it may be absent -> drop safely.
+    df = df.drop(columns=['EntityClass'], errors='ignore')
     return df
 
 def save_results(entity_class, output_dir: str, symbolic_series: pd.DataFrame, states_df, max_gap: int):

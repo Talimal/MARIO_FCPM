@@ -498,10 +498,10 @@ def submit_stage2_job(dataset_params, fold_num, abs_combo, mine_combo, abstracti
     stage_num = 2; dataset_name = dataset_params['dataset_name']; abs_param_string = create_param_string(abs_combo, prefix="abs"); mining_param_string = create_param_string(mine_combo, prefix="mine")
     mining_run_dir = os.path.join(abstraction_run_dir, mining_param_string); tirp_objects_output_dir = os.path.join(mining_run_dir, "tirps"); stage2_done_file = os.path.join(mining_run_dir, 'stage2_mining.done')
     if not os.path.exists(stage2_done_file):
-        # Stage 1 gate: accept the MARIO single-file output (KL.txt) or the legacy per-class output.
+        # Stage 1 gate: the MARIO abstraction always writes a single KL.txt
+        # (forecasting has no classes, so there are no per-class KL files).
         train_dir = os.path.join(abstraction_run_dir, 'Train')
-        if not (os.path.exists(os.path.join(train_dir, 'KL.txt')) or
-                os.path.exists(os.path.join(train_dir, 'KL-class-0.0.txt'))): return False
+        if not os.path.exists(os.path.join(train_dir, 'KL.txt')): return False
         os.makedirs(tirp_objects_output_dir, exist_ok=True); job_name = f"stg2_{dataset_name}_f{fold_num}_{abs_param_string}_{mining_param_string}"
         try: script_basename = config.WRAPPER_SCRIPT_PATHS[stage_num]; script_path = os.path.join(config.CODE_DIR, script_basename)
         except KeyError: print(f"ERROR: Wrapper path for Stage {stage_num} missing."); return False
@@ -513,18 +513,22 @@ def submit_stage2_job(dataset_params, fold_num, abs_combo, mine_combo, abstracti
 # --- NEW Stage 3: Build Model Only ---
 # --- NEW Stage 3: Build Model Only (Batched) ---
 def submit_stage3_batch_job(dataset_params, fold_num, abs_combo, mine_combo, batch_num, tirp_list_file,
-                           abstraction_run_dir, mining_run_dir, log_dir, base_dir, event_symbol):
-    """Submits job for Stage 3: Build TIRP Model for a batch of TIRPs."""
+                           abstraction_run_dir, mining_run_dir, log_dir, base_dir):
+    """Submits job for MARIO Stage 3: build a per-TIRP forecast model for a batch of TIRPs."""
     stage_num = 3; dataset_name = dataset_params['dataset_name']
     abs_param_string = create_param_string(abs_combo, prefix="abs")
     mining_param_string = create_param_string(mine_combo, prefix="mine")
-    
+
+    # MARIO forecast target: which variable's future state, and how far ahead.
+    target_variable = dataset_params['target_variable']
+    horizon = dataset_params.get('horizon', config.DEFAULT_HORIZON)
+
     # Output directory for the built model components (base dir for all models in this mining run)
     built_model_base_dir = os.path.join(mining_run_dir, "feature_matrix")
     os.makedirs(built_model_base_dir, exist_ok=True) # Ensure base dir exists
 
     # Done file for the BATCH (to track submission/completion of the batch job itself)
-    # We store batch done files in the mining run dir or a temp dir? 
+    # We store batch done files in the mining run dir or a temp dir?
     # Let's put them in a 'status' subdir within feature_matrix to keep it clean, or just in feature_matrix
     batch_status_dir = os.path.join(built_model_base_dir, "batch_status")
     os.makedirs(batch_status_dir, exist_ok=True)
@@ -532,168 +536,163 @@ def submit_stage3_batch_job(dataset_params, fold_num, abs_combo, mine_combo, bat
 
     if not os.path.exists(stage3_batch_done_file):
          if not os.path.exists(tirp_list_file): return False
-         
-         # Inputs needed: Original KL files from Stage 1 might still be needed if feature matrix logic uses them
-         expected_stage1_output_train_cls0 = os.path.join(abstraction_run_dir, 'Train', 'KL-class-0.0.txt')
-         if not os.path.exists(expected_stage1_output_train_cls0): return False
-         
+
+         # Stage 3 reads the training KL (target STIs + durations detection) from Stage 1.
+         expected_stage1_train_kl = os.path.join(abstraction_run_dir, 'Train', 'KL.txt')
+         if not os.path.exists(expected_stage1_train_kl): return False
+
          job_name = f"stg3_{dataset_name}_f{fold_num}_{abs_param_string}_{mining_param_string}_batch_{batch_num}"
          try: script_basename = config.WRAPPER_SCRIPT_PATHS[stage_num]; script_path = os.path.join(config.CODE_DIR, script_basename)
          except KeyError: print(f"ERROR: Wrapper path for Stage {stage_num} missing."); return False
          if not os.path.exists(script_path): print(f"ERROR: Wrapper script not found: {script_path}."); return False
-         
-         # Arguments for run_stage3_build_model.py (Updated for batching):
-         arguments = (f"--abstraction_output_dir \"{abstraction_run_dir}\" " # Needed for original KL files?
+
+         # Arguments for run_stage3_build_model.py (MARIO forecast):
+         arguments = (f"--abstraction_output_dir \"{abstraction_run_dir}\" " # Stage 1 dir (Train/KL.txt)
                       f"--tirp_model_run_dir \"{built_model_base_dir}\" "    # Base dir where 'tirp_X' folders will be created
                       f"--tirp_list_file \"{tirp_list_file}\" "              # Path to file containing list of TIRPs to process
                       f"--max_gap {mine_combo['mg']} "
                       f"--num_relations {mine_combo['rel']} "
                       f"--epsilon {mine_combo['e']} "
-                      f"--event_symbol {event_symbol} ")
-         
-         if getattr(config, 'BUILD_CPML', False):
-             arguments += "--build_cpml "
-             
+                      f"--target_variable {target_variable} "
+                      f"--horizon {horizon} ")
+
          return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage3_batch_done_file, log_dir, base_dir,
                                   config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)
     return False
 
 # --- NEW Stage 3.5: Validation ---
 def submit_stage3_5_batch_job(dataset_params, fold_num, abs_combo, mine_combo, batch_num, tirp_list_file,
-                           abstraction_run_dir, mining_run_dir, log_dir, base_dir, event_symbol):
-    """Submits job for Stage 3.5: Validation for a batch of TIRPs."""
+                           abstraction_run_dir, mining_run_dir, log_dir, base_dir):
+    """Submits job for MARIO Stage 3.5: train-set forecast-accuracy check for a batch of TIRPs."""
     stage_num = 3.5 # Specific SLURM resources
     dataset_name = dataset_params['dataset_name']
     abs_param_string = create_param_string(abs_combo, prefix="abs")
     mining_param_string = create_param_string(mine_combo, prefix="mine")
-    
+
+    # Must match the Stage 3 build so the same training matrix is reconstructed.
+    target_variable = dataset_params['target_variable']
+    horizon = dataset_params.get('horizon', config.DEFAULT_HORIZON)
+
     built_model_base_dir = os.path.join(mining_run_dir, "feature_matrix")
-    
+
     batch_status_dir = os.path.join(built_model_base_dir, "batch_status_val")
     os.makedirs(batch_status_dir, exist_ok=True)
     stage3_5_batch_done_file = os.path.join(batch_status_dir, f'stage3_5_batch_{batch_num:04d}.done')
 
     if not os.path.exists(stage3_5_batch_done_file):
          if not os.path.exists(tirp_list_file): return False
-         
+
          job_name = f"stg3_5_{dataset_name}_f{fold_num}_{abs_param_string}_{mining_param_string}_batch_{batch_num}"
          script_path = os.path.join(config.CODE_DIR, "run_stage3_5_validation.py")
          if not os.path.exists(script_path): print(f"ERROR: Wrapper script not found: {script_path}."); return False
-         
-         # Retrieve parameters
-         epsilon_val = config.EPSILON_FCPM
-         tte_w_list = dataset_params.get('TTE_W', [10000])
-         ew_w = tte_w_list[0] if len(tte_w_list) > 0 else 10000
-         e_w_list = dataset_params.get('e_w', [0])
-         ew_e = e_w_list[0] if len(e_w_list) > 0 else 0
 
          arguments = (f"--tirp_model_run_dir \"{built_model_base_dir}\" "
                       f"--tirp_list_file \"{tirp_list_file}\" "
                       f"--abstraction_output_dir \"{abstraction_run_dir}\" "
-                      f"--epsilon {epsilon_val} "
-                      f"--ew_window_size {ew_w} "
-                      f"--ew_early_warning_value {ew_e} ")
-         
+                      f"--target_variable {target_variable} "
+                      f"--horizon {horizon} ")
+
          return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage3_5_batch_done_file, log_dir, base_dir,
                                   config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)
     return False
 
-# --- NEW Stage 4: Predict per Entity Batch ---
-def submit_stage4_job(dataset_params, fold_num, abs_combo, mine_combo, batch_num, total_batches, entity_list_file,
-                      abstraction_run_dir, mining_run_dir, log_dir, base_dir):
-    """Submits job for Stage 4: Predict for a batch of entities."""
-    stage_num = 4; dataset_name = dataset_params['dataset_name']; abs_param_string = create_param_string(abs_combo, prefix="abs"); mining_param_string = create_param_string(mine_combo, prefix="mine")
+# --- NEW Stage 4: Forecast on the TEST set per TIRP Batch (MARIO) ---
+def submit_stage4_batch_job(dataset_params, fold_num, abs_combo, mine_combo, batch_num, tirp_list_file,
+                            abstraction_run_dir, mining_run_dir, log_dir, base_dir):
+    """Submits job for MARIO Stage 4: forecast the target symbol at t+HORIZON on the TEST
+    set for a BATCH of TIRPs, using the Stage 3 models. Test-set twin of Stage 3 —
+    batched by TIRP (not by entity as the old FCPM Stage 4 was)."""
+    stage_num = 4; dataset_name = dataset_params['dataset_name']
+    abs_param_string = create_param_string(abs_combo, prefix="abs")
+    mining_param_string = create_param_string(mine_combo, prefix="mine")
 
-    # Output directory for predictions for this batch
+    # Must match the Stage 3 build so the model's classes line up with the target symbols.
+    target_variable = dataset_params['target_variable']
+    horizon = dataset_params.get('horizon', config.DEFAULT_HORIZON)
+
+    # Stage 3 saved the models here; Stage 4 writes forecasts under predictions/.
+    built_models_base_dir = os.path.join(mining_run_dir, "feature_matrix")
     prediction_base_dir = os.path.join(mining_run_dir, "predictions")
-    # Done files stored separately from prediction data
+    os.makedirs(prediction_base_dir, exist_ok=True)
+
     batch_status_dir = os.path.join(mining_run_dir, "batch_status_stage4")
     os.makedirs(batch_status_dir, exist_ok=True)
-    stage4_done_file = os.path.join(batch_status_dir, f'stage4_predict_batch_{batch_num:04d}.done')
+    stage4_batch_done_file = os.path.join(batch_status_dir, f'stage4_batch_{batch_num:04d}.done')
 
-    if not os.path.exists(stage4_done_file):
-        job_name = f"stg4_{dataset_name}_f{fold_num}_{abs_param_string}_{mining_param_string}_predict_b{batch_num}"
+    if not os.path.exists(stage4_batch_done_file):
+        if not os.path.exists(tirp_list_file): return False
+
+        # Stage 4 detects each TIRP's prefixes on the TEST KL (target STIs for ground truth
+        # come from the same file). Wait for Stage 1's Test/KL.txt before dispatching.
+        expected_stage1_test_kl = os.path.join(abstraction_run_dir, 'Test', 'KL.txt')
+        if not os.path.exists(expected_stage1_test_kl): return False
+
+        job_name = f"stg4_{dataset_name}_f{fold_num}_{abs_param_string}_{mining_param_string}_batch_{batch_num}"
         try: script_basename = config.WRAPPER_SCRIPT_PATHS[stage_num]; script_path = os.path.join(config.CODE_DIR, script_basename)
         except KeyError: print(f"ERROR: Wrapper path for Stage {stage_num} missing."); return False
         if not os.path.exists(script_path): print(f"ERROR: Wrapper script not found: {script_path}."); return False
 
-        # Directory where Stage 3 saved the built models for all TIRPs of this mining run
-        built_models_base_dir = os.path.join(mining_run_dir, "feature_matrix")
+        # Arguments for run_stage4_predict_entities.py (MARIO forecast on TEST):
+        arguments = (f"--abstraction_output_dir \"{abstraction_run_dir}\" "   # Stage 1 dir (Test/KL.txt)
+                     f"--built_models_base_dir \"{built_models_base_dir}\" "   # Stage 3 models (tirp_<id>/models)
+                     f"--prediction_output_dir \"{prediction_base_dir}\" "     # Where forecasts.csv.gz are written
+                     f"--tirp_list_file \"{tirp_list_file}\" "                 # TIRPs to forecast in this batch
+                     f"--max_gap {mine_combo['mg']} "
+                     f"--num_relations {mine_combo['rel']} "
+                     f"--epsilon {mine_combo['e']} "
+                     f"--target_variable {target_variable} "
+                     f"--horizon {horizon} ")
 
-        # Arguments for run_stage4_predict_entities.py
-        arguments = (f"--entity_list_file \"{entity_list_file}\" "          # File containing entities for this batch
-                     f"--built_models_base_dir \"{built_models_base_dir}\" "  # Dir with all built TIRP models
-                     f"--prediction_output_dir \"{prediction_base_dir}\" ") # Where to save this batch's predictions
-
-        return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage4_done_file, log_dir, base_dir,
+        return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage4_batch_done_file, log_dir, base_dir,
                                  config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)
     return False
 
 
 
 
-def submit_stage5_job(dataset_params, fold_num, abs_combo, mine_combo, model_combo, tirp_selection_method,
-                     mining_run_dir, log_dir, base_dir, model_nickname="FCPM"): # Added model_nickname
-    """Submits job for Stage 5: Aggregation and Evaluation."""
-    stage_num = 5; dataset_name = dataset_params['dataset_name']
-    # Generate param strings needed for job name, output file name, and potentially passing to wrapper
-    abs_param_string = create_param_string(abs_combo)
-    mining_param_string = create_param_string(mine_combo)
-    model_param_string = create_param_string(model_combo)
-    results_dir = os.path.join(base_dir,dataset_name, "results") # Renamed for clarity
-    tte_w_list = dataset_params.get('TTE_W', [])
-    e_w_list = dataset_params.get('e_w', [])
-    tte_w_str = ",".join(map(str, tte_w_list))
-    e_w_str = ",".join(map(str, e_w_list))
- 
-    # Final results for this aggregation method and TIRP selection method go here
-    final_results_output_dir = os.path.join(mining_run_dir, "results") # Renamed for clarity
-    final_result_file_base = os.path.join(final_results_output_dir, f"{model_nickname}_{model_param_string}_{tirp_selection_method}") # Base name for output
-    # Done file indicates this specific aggregation/evaluation finished
-    stage5_done_file = f"{final_result_file_base}{e_w_str}.done"
+def submit_stage5_job(dataset_params, fold_num, abs_combo, mine_combo, model_combo,
+                     fold_dir, mining_run_dir, log_dir, base_dir):
+    """
+    Submit Stage 5 (MARIO): cross-TIRP forecast aggregation + evaluation for ONE
+    aggregation-hyperparameter combo (aggregation_method x context_window x warmup).
 
-    # Directory containing the raw prediction outputs from all Stage 4 batches
-    prediction_base_dir = os.path.join(mining_run_dir, f"predictions_{model_nickname}")
+    Inputs are the Stage 4 per-TIRP forecasts (mining_run_dir/predictions) and the
+    Stage 0 split manifest (fold_dir/split_manifest.csv). Each combo writes its
+    aggregated forecasts + metrics into its own results subdir.
+    """
+    stage_num = 5
+    dataset_name = dataset_params['dataset_name']
+    abs_param_string = create_param_string(abs_combo, prefix="abs")
+    mining_param_string = create_param_string(mine_combo, prefix="mine")
+    agg_param_string = create_param_string(model_combo, prefix="agg")
 
-    if not os.path.exists(stage5_done_file):
-        os.makedirs(final_results_output_dir, exist_ok=True)
-        job_name = f"stg5_{dataset_name}_{model_nickname}_f{fold_num}_abs_{abs_param_string}_mine_{mining_param_string}_agg_{model_param_string}_{tirp_selection_method}" # Include all param strings
-        try: script_basename = config.WRAPPER_SCRIPT_PATHS[stage_num]; script_path = os.path.join(config.CODE_DIR, script_basename)
-        except KeyError: print(f"ERROR: Wrapper path Stage {stage_num} missing."); return False
-        if not os.path.exists(script_path): print(f"ERROR: Wrapper not found: {script_path}."); return False
+    prediction_output_dir = os.path.join(mining_run_dir, "predictions")   # Stage 4 output
+    split_manifest_path = os.path.join(fold_dir, "split_manifest.csv")    # Stage 0 output
+    results_output_dir = os.path.join(mining_run_dir, "results", agg_param_string)
+    # The wrapper writes this on success and the sbatch template also touches it.
+    stage5_done_file = os.path.join(results_output_dir, "stage5_aggregation.done")
 
-        # --- Prepare Arguments for Stage 5 Wrapper ---
-        arguments_list = []
-        # General Info
-        arguments_list.append(f"--dataset_name \"{dataset_name}\"")
-        arguments_list.append(f"--fold_num {fold_num}")
-        # Abstraction Params (pass individually)
-        for key, value in sorted(abs_combo.items()):
-            arguments_list.append(f"--abs_{key} \"{value}\"") # Add prefix 'abs_'
-        # Mining Params (pass individually)
-        for key, value in sorted(mine_combo.items()):
-            arguments_list.append(f"--mine_{key} \"{value}\"") # Add prefix 'mine_'
-        # Aggregation/Eval Params (pass individually)
-        for key, value in sorted(model_combo.items()):
-            arguments_list.append(f"--agg_{key} \"{value}\"") # Add prefix 'agg_'
-        
-        arguments_list.append(f"--tirp_selection_method \"{tirp_selection_method}\"")
-        arguments_list.append(f"--TTE_W_list \"{tte_w_str}\"")
-        arguments_list.append(f"--e_w_list \"{e_w_str}\"")
-        arguments_list.append(f"--model_type \"{model_nickname}\"") # Added model_type argument
-        
-        # Paths
-        arguments_list.append(f"--prediction_base_dir \"{prediction_base_dir}\"") # Input: Where prediction files are
-        arguments_list.append(f"--output_csv_path \"{final_results_output_dir}\"") # Output: Specific CSV for this run
-        arguments_list.append(f"--results_dir \"{results_dir}\"") # Output: Specific CSV for this run
+    if os.path.exists(stage5_done_file):
+        return False
 
+    os.makedirs(results_output_dir, exist_ok=True)
+    job_name = f"stg5_{dataset_name}_f{fold_num}_{abs_param_string}_{mining_param_string}_{agg_param_string}"
+    try: script_basename = config.WRAPPER_SCRIPT_PATHS[stage_num]; script_path = os.path.join(config.CODE_DIR, script_basename)
+    except KeyError: print(f"ERROR: Wrapper path Stage {stage_num} missing."); return False
+    if not os.path.exists(script_path): print(f"ERROR: Wrapper not found: {script_path}."); return False
 
-        # Join arguments
-        arguments = " ".join(arguments_list)
-        # --- End Argument Preparation ---
+    agg_method = model_combo.get('aggregation_method', getattr(config, 'STAGE5_AGGREGATION_METHOD', 'average'))
+    context_window = model_combo.get('context_window', getattr(config, 'STAGE5_CONTEXT_WINDOW', 0))
+    warmup = model_combo.get('warmup', getattr(config, 'STAGE5_WARMUP', 0))
 
-        return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage5_done_file, log_dir, base_dir,
-                                config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)
+    arguments = (f"--prediction_output_dir \"{prediction_output_dir}\" "
+                 f"--split_manifest_path \"{split_manifest_path}\" "
+                 f"--results_output_dir \"{results_output_dir}\" "
+                 f"--aggregation_method \"{agg_method}\" "
+                 f"--context_window {context_window} --warmup {warmup}")
+
+    return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage5_done_file, log_dir, base_dir,
+                            config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)
 def submit_cleanup_job(dataset_name, fold_num, fold_dir_path, log_dir, base_dir):
     """Submits job for Cleanup of fold directory."""
     # This is not a formal numeric stage, but a named task
@@ -893,7 +892,7 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
     log_dir = os.path.join(base_dir, "logs"); sbatch_scripts_dir = os.path.join(base_dir, "sbatch_scripts"); temp_dir = os.path.join(base_dir, "temp_files")
     os.makedirs(log_dir, exist_ok=True); os.makedirs(sbatch_scripts_dir, exist_ok=True); os.makedirs(temp_dir, exist_ok=True)
 
-    abstraction_params_keys = ["d_method", "b", "ig"]; mining_params_keys = ["mvs", "mg", "rel", "sf", "e"]; model_params_keys = ["aggregation_method", "num_tirps_for_selection"]
+    abstraction_params_keys = ["d_method", "b", "ig"]; mining_params_keys = ["mvs", "mg", "rel", "sf", "e"]; model_params_keys = ["aggregation_method", "context_window", "warmup"]  # MARIO Stage 5 aggregation hyperparameter grid
     total_datasets = len(datasets_list)
 
     # --- Setup logger ---
@@ -1023,17 +1022,17 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
         #   already been sent to SLURM in this session. Prevents double-submission if the
         #   orchestrator restarts or a cycle re-scans the same combination. The authoritative
         #   completion signal is always the *.done file on disk, not membership in these sets.
-        # stage4_trigger_status: Keyed by job_id_stage2 (fold+abs+mine tuple). Stores whether
-        #   Stage 4 entity-batch jobs have been dispatched for a given mining configuration,
-        #   plus the expected number of batches — used to check Stage 4 completion later.
+        # stage4_selection_updated: Set of job_id_stage2 keys whose TIRP-selection scores
+        #   have already been updated with Stage 3.5 validation metrics (a one-time step that
+        #   must run once per mining run, before Stage 4 forecasting is dispatched).
         # counted_combinations: Tracks which (fold, abs, mine) combos have already been
         #   counted as "complete" to avoid incrementing the progress counter every cycle.
         active_monitoring = True
         submitted_jobs_stage1 = set(); submitted_jobs_stage2 = set()
         submitted_jobs_stage3 = set(); submitted_jobs_stage3_5 = set()
-        submitted_jobs_stage4 = {}   # key=(fold,abs,mine) → set of submitted batch IDs
+        submitted_jobs_stage4 = set()   # MARIO Stage 4 is batched by TIRP (like Stage 3)
         submitted_jobs_stage5 = set()
-        stage4_trigger_status = {}   # key=(fold,abs,mine) → {'triggered', 'num_batches', 'entity_ids'}
+        stage4_selection_updated = set()  # job_id_stage2 keys with post-3.5 score update done
         counted_combinations = set()
         deleted_feature_matrices = set()  # Track feature_matrix dirs already cleared
         monitoring_cycles, consecutive_idle_cycles = 0, 0
@@ -1191,7 +1190,7 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
                                             f_list.write(f"{full_path}\n")
 
                                     if submit_stage3_batch_job(dataset_params, fold_num, abs_combo, mine_combo, batch_num, batch_list_path,
-                                                              abstraction_run_dir, mining_run_dir, log_dir, base_dir, event_symbol):
+                                                              abstraction_run_dir, mining_run_dir, log_dir, base_dir):
                                         submitted_jobs_stage3.add(job_id_stage3_batch)
                                         new_jobs_submitted_this_cycle = True
                             
@@ -1257,7 +1256,7 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
                                                 f_list.write(f"{full_path}\n")
 
                                         if submit_stage3_5_batch_job(dataset_params, fold_num, abs_combo, mine_combo, batch_num, batch_list_path,
-                                                                  abstraction_run_dir, mining_run_dir, log_dir, base_dir, event_symbol):
+                                                                  abstraction_run_dir, mining_run_dir, log_dir, base_dir):
                                             submitted_jobs_stage3_5.add(job_id_stage3_5_batch)
                                             new_jobs_submitted_this_cycle = True
 
@@ -1288,20 +1287,15 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
                             except Exception as e:
                                 logger.warning(f"Could not write stage3 sentinel at {stage3_sentinel_path}: {e}")
 
-                        # --- Stage 3.5 Done: Trigger Stage 4 (Predict Batches) if not already triggered ---
-                        # stage4_key ties Stage 4 state to the exact (fold, abstraction, mining) config.
-                        # Keying by job_id_stage2 ensures we dispatch entity-batch jobs exactly once
-                        # per mining run, even if the monitoring loop revisits this combination in
-                        # subsequent cycles.
+                        # --- Stage 3.5 Done: one-time TIRP-selection-score update, then Stage 4 ---
+                        # stage4_key ties the one-time score update to the exact (fold, abs, mine)
+                        # config so it runs exactly once per mining run.
                         stage4_key = job_id_stage2
-                        if stage4_key not in stage4_trigger_status:
-                            print(f"  All Stage 3.5 validations finished for {mining_run_dir}. Triggering Stage 4 predictions...")
-
-                            print("Stage 3.5 completed for all TIRPs. Updating TIRP selection scores with validation metrics...")
-
+                        if stage4_key not in stage4_selection_updated:
+                            print(f"  All Stage 3.5 validations finished for {mining_run_dir}. "
+                                  f"Updating TIRP selection scores with validation metrics...")
                             current_tirp_selection_file = os.path.join(mining_run_dir, 'tirp_selection_scores.csv')
                             feature_matrix_dir = os.path.join(mining_run_dir, "feature_matrix")
-
                             try:
                                 update_tirp_selection_scores_inplace(
                                     tirp_selection_scores_path=current_tirp_selection_file,
@@ -1310,117 +1304,84 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
                                 )
                             except Exception as update_error:
                                 print(f"CRITICAL ERROR updating TIRP selection scores: {update_error}")
-                                # Depending on your logic, you might want to sys.exit(1) here if this is mandatory
+                            stage4_selection_updated.add(stage4_key)
+                            print("Proceeding to Stage 4 (forecast on TEST set)...")
 
-                            print("Proceeding to Stage 4...")
+                        # --- Submit Stage 4 forecast jobs, BATCHED by TIRP (mirrors Stage 3) ---
+                        # Same TIRP list, sorting, and per-TIRP done-file completion scan as
+                        # Stage 3; the model now runs on the TEST KL and writes forecasts.csv.gz.
+                        all_stage4_done_for_this_run = True
+                        prediction_base_dir = os.path.join(mining_run_dir, "predictions")
 
-                            entity_ids = get_test_entity_ids(abstraction_run_dir)
-                            num_entities = len(entity_ids)
-                            batch_size = config.ENTITY_BATCH_SIZE_FOR_PREDICTION
-                            num_batches = math.ceil(num_entities / batch_size) if batch_size > 0 else 1
-                            print(f"    Found {num_entities} test entities, creating {num_batches} prediction batches (size={batch_size}).")
-
-                            stage4_trigger_status[stage4_key] = {'triggered': True, 'num_batches': num_batches, 'entity_ids': entity_ids}
-                            submitted_jobs_stage4[stage4_key] = set() # Initialize set for submitted batch IDs
-
-                            prediction_base_dir = os.path.join(mining_run_dir, "predictions")
-                            temp_batch_dir = os.path.join(temp_dir, dataset_name, f'fold_{fold_num}', abs_param_string, mining_param_string)
+                        if expected_stage3_jobs_count == 0:
+                            all_stage4_done_for_this_run = True  # No TIRPs -> nothing to forecast
+                        else:
+                            batch_size_s4 = getattr(config, 'TIRP_BATCH_SIZE_STAGE4',
+                                                    getattr(config, 'TIRP_BATCH_SIZE_STAGE3',
+                                                            getattr(config, 'TIRP_BATCH_SIZE', 1)))
+                            if batch_size_s4 < 1: batch_size_s4 = 1
+                            num_batches_s4 = math.ceil(expected_stage3_jobs_count / batch_size_s4) if batch_size_s4 > 0 else 1
+                            temp_batch_dir = os.path.join(temp_dir, dataset_name, f'fold_{fold_num}', abs_param_string, mining_param_string, 'stage4_batches')
                             os.makedirs(temp_batch_dir, exist_ok=True)
 
-                            if num_entities > 0 and batch_size > 0:
-                                for i in range(num_batches):
-                                    start_idx = i * batch_size
-                                    end_idx = start_idx + batch_size
-                                    entity_batch = entity_ids[start_idx:end_idx]
-                                    batch_id = i + 1
+                            for i in range(num_batches_s4):
+                                start_idx = i * batch_size_s4
+                                end_idx = min(start_idx + batch_size_s4, expected_stage3_jobs_count)
+                                batch_files = tirp_object_files[start_idx:end_idx]
+                                batch_num = i + 1
+                                batch_list_filename = f"batch_{batch_num:04d}_tirps.txt"
+                                batch_list_path = os.path.join(temp_batch_dir, batch_list_filename)
+                                job_id_stage4_batch = (fold_num, tuple(sorted(abs_combo.items())), tuple(sorted(mine_combo.items())), f"stage4_batch_{batch_num}")
 
-                                    # Create temp file for entity list
-                                    entity_list_file = os.path.join(temp_batch_dir, f"batch_{batch_id:04d}_entities.txt")
-                                    with open(entity_list_file, 'w') as f_ent:
-                                        for ent_id in entity_batch: f_ent.write(f"{ent_id}\n")
+                                if job_id_stage4_batch not in submitted_jobs_stage4:
+                                    with open(batch_list_path, 'w') as f_list:
+                                        for t_file in batch_files:
+                                            full_path = os.path.join(tirp_objects_dir, t_file)
+                                            f_list.write(f"{full_path}\n")
 
-                                    # Submit job for this batch
-                                    if submit_stage4_job(dataset_params, fold_num, abs_combo, mine_combo, batch_id, num_batches, entity_list_file,
-                                                        abstraction_run_dir, mining_run_dir, log_dir, base_dir):
-                                        submitted_jobs_stage4[stage4_key].add(batch_id)
+                                    if submit_stage4_batch_job(dataset_params, fold_num, abs_combo, mine_combo, batch_num, batch_list_path,
+                                                              abstraction_run_dir, mining_run_dir, log_dir, base_dir):
+                                        submitted_jobs_stage4.add(job_id_stage4_batch)
                                         new_jobs_submitted_this_cycle = True
-                            elif num_entities == 0:
-                                 print("    Warning: No test entities found. Skipping prediction stage.")
-                                 # Mark as 'done' since there's nothing to predict
-                                 stage4_trigger_status[stage4_key]['num_batches'] = 0
 
+                            # Completion: scan per-TIRP Stage 4 done files (catches partial batch failures).
+                            for tirp_filename in tirp_object_files:
+                                full_tirp_file_path = os.path.join(tirp_objects_dir, tirp_filename)
+                                sanitized_tirp_id = get_sanitized_tirp_id(full_tirp_file_path)
+                                if not sanitized_tirp_id: continue
+                                pred_tirp_dir = os.path.join(prediction_base_dir, f'tirp_{sanitized_tirp_id}')
+                                stage4_done_path = os.path.join(pred_tirp_dir, f'stage4_predict_{sanitized_tirp_id}.done')
+                                if not os.path.exists(stage4_done_path):
+                                    all_stage4_done_for_this_run = False
+                                    break # One missing is enough
 
-                        # --- Check Stage 4 Completion ---
-                        all_stage4_done_for_this_run = True
-                        status_info = stage4_trigger_status.get(stage4_key)
-                        if not status_info or not status_info.get('triggered'):
-                             all_stage4_done_for_this_run = False # Not triggered yet
-                        else:
-                            num_expected_batches = status_info['num_batches']
-                            if num_expected_batches == 0:
-                                 all_stage4_done_for_this_run = True # No batches needed, so considered done
-                            else:
-                                batch_status_dir = os.path.join(mining_run_dir, "batch_status_stage4")
-                                for batch_num in range(1, num_expected_batches + 1):
-                                    stage4_done_file = os.path.join(batch_status_dir, f'stage4_predict_batch_{batch_num:04d}.done')
-                                    if not os.path.exists(stage4_done_file):
-                                        all_stage4_done_for_this_run = False
-                                        break # One missing is enough
-
-                        if not all_stage4_done_for_this_run: 
+                        if not all_stage4_done_for_this_run:
                             all_expected_final_jobs_done = False; combination_complete = False
                             combo_status['stage4'] = 'waiting'
-                            continue # Wait for stage 4 predictions
+                            continue # Wait for stage 4 forecasts
                         else:
                             combo_status['stage4'] = 'done'
                             cycle_progress['stage_stats'][4] += 1
 
-                        # --- Stage 4 Done: Submit Stage 5 (Aggregation) ---
+                        # --- Stage 4 Done: Submit Stage 5 (MARIO cross-TIRP aggregation) ---
+                        # One job per aggregation-hyperparameter combo (aggregation_method x
+                        # context_window x warmup). Each writes its own results subdir keyed by
+                        # the agg param string; completion is that subdir's stage5_aggregation.done.
                         if model_combinations and model_combinations != [{}]:
                             all_stage5_done_for_this_run = True  # Track Stage 5 completion for this combination
-                            
-                            models_to_eval = ["FCPM", "CPML"] if getattr(config, 'BUILD_CPML', False) else ["FCPM"]
-                            e_w_str = ",".join(map(str, dataset_params.get('e_w', [])))
 
-                            # Handle "all" method specially - only run once per aggregation_method
-                            if "all" in Tirp_selection_methods:
-                                aggregation_methods = set()
-                                for model_combo in model_combinations:
-                                    if "aggregation_method" in model_combo:
-                                        aggregation_methods.add(model_combo["aggregation_method"])
-                                
-                                for agg_method in aggregation_methods:
-                                    model_combo_for_all = next((mc for mc in model_combinations if mc.get("aggregation_method") == agg_method), None)
-                                    
-                                    if model_combo_for_all:
-                                        for m_nick in models_to_eval:
-                                            job_id_stage5 = (fold_num, tuple(sorted(abs_combo.items())), tuple(sorted(mine_combo.items())), tuple(sorted(model_combo_for_all.items())), "all", m_nick)
-                                            model_param_str = create_param_string(model_combo_for_all)
-                                            stg5_done_file = os.path.join(mining_run_dir, "results", f"{m_nick}_{model_param_str}_all{e_w_str}.done")
-                                        
-                                            if job_id_stage5 not in submitted_jobs_stage5 and not os.path.exists(stg5_done_file):
-                                                if submit_stage5_job(dataset_params, fold_num, abs_combo, mine_combo, model_combo_for_all, "all", mining_run_dir, log_dir, base_dir, model_nickname=m_nick):
-                                                    submitted_jobs_stage5.add(job_id_stage5); new_jobs_submitted_this_cycle = True
-                                                all_stage5_done_for_this_run = False
-                                            elif not os.path.exists(stg5_done_file):
-                                                all_stage5_done_for_this_run = False
-                            
-                            # Handle other TIRP selection methods normally (run for each num_tirps_for_selection value)
                             for model_combo in model_combinations:
-                                for tirp_selection_method in Tirp_selection_methods:
-                                    if tirp_selection_method == "all": continue
-                                    
-                                    for m_nick in models_to_eval:
-                                        job_id_stage5 = (fold_num, tuple(sorted(abs_combo.items())), tuple(sorted(mine_combo.items())), tuple(sorted(model_combo.items())), tirp_selection_method, m_nick)
-                                        model_param_str = create_param_string(model_combo)
-                                        stg5_done_file = os.path.join(mining_run_dir, "results", f"{m_nick}_{model_param_str}_{tirp_selection_method}{e_w_str}.done")
+                                agg_param_string = create_param_string(model_combo, prefix="agg")
+                                stg5_done_file = os.path.join(mining_run_dir, "results", agg_param_string, "stage5_aggregation.done")
+                                if os.path.exists(stg5_done_file):
+                                    continue  # this combo already finished
 
-                                        if job_id_stage5 not in submitted_jobs_stage5 and not os.path.exists(stg5_done_file):
-                                            if submit_stage5_job(dataset_params, fold_num, abs_combo, mine_combo, model_combo, tirp_selection_method, mining_run_dir, log_dir, base_dir, model_nickname=m_nick):
-                                                submitted_jobs_stage5.add(job_id_stage5); new_jobs_submitted_this_cycle = True
-                                            all_stage5_done_for_this_run = False
-                                        elif not os.path.exists(stg5_done_file):
-                                            all_stage5_done_for_this_run = False
+                                all_stage5_done_for_this_run = False
+                                job_id_stage5 = (fold_num, tuple(sorted(abs_combo.items())), tuple(sorted(mine_combo.items())), tuple(sorted(model_combo.items())))
+                                if job_id_stage5 not in submitted_jobs_stage5:
+                                    if submit_stage5_job(dataset_params, fold_num, abs_combo, mine_combo, model_combo,
+                                                         fold_dir, mining_run_dir, log_dir, base_dir):
+                                        submitted_jobs_stage5.add(job_id_stage5); new_jobs_submitted_this_cycle = True
 
                             # Check if all Stage 5 jobs for this run are complete
                             if not all_stage5_done_for_this_run:

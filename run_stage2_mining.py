@@ -1,6 +1,5 @@
 import pandas as pd
 import os
-import glob
 import argparse
 import sys
 import time
@@ -58,27 +57,18 @@ def load_training_kl(abstraction_output_dir, kl_data_dir):
     """
     Loads the Stage 1 training STIs into a single combined KL file for mining.
 
-    MARIO has no classes, so mining runs over one pool of entities. Prefers a
-    single 'Train/KL.txt' (the MARIO Stage 1 output). For backward compatibility
-    with the FCPM Stage 1 output, falls back to concatenating any
-    'Train/KL-class-*.txt' files (which together are just all training entities).
+    MARIO has no classes, so mining runs over one pool of entities read from the
+    single 'Train/KL.txt' produced by Stage 1.
 
     Returns (combined_kl_path, total_entities).
     """
     train_dir = os.path.join(abstraction_output_dir, 'Train')
     single_kl = os.path.join(train_dir, 'KL.txt')
 
-    if os.path.exists(single_kl):
-        df = txt_2_csv(single_kl)
-    else:
-        class_files = sorted(glob.glob(os.path.join(train_dir, 'KL-class-*.txt')))
-        if not class_files:
-            print(f"ERROR: No training KL file found in {train_dir} "
-                  f"(expected 'KL.txt' or 'KL-class-*.txt').")
-            sys.exit(1)
-        print(f"  No single KL.txt; concatenating {len(class_files)} class file(s): "
-              f"{[os.path.basename(f) for f in class_files]}")
-        df = pd.concat([txt_2_csv(f) for f in class_files], ignore_index=True)
+    if not os.path.exists(single_kl):
+        print(f"ERROR: No training KL file found in {train_dir} (expected 'KL.txt').")
+        sys.exit(1)
+    df = txt_2_csv(single_kl)
 
     if df.empty:
         print("ERROR: Training KL data is empty after parsing.")
