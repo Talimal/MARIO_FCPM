@@ -5,12 +5,12 @@ import argparse
 import sys
 import traceback
 
-from config import SEED, HOLDOUT_ENTITY_FRACTION, CHRONO_SPLIT_RATIO
+from config import SEED, HOLDOUT_ENTITY_FRACTION, CHRONO_SPLIT_RATIO, SUBSAMPLE_ENTITIES
 
 
 def split_dataset_forecasting(dataset_name, data_path, horizon,
                               holdout_entity_fraction, chrono_split_ratio,
-                              seed, split_dir):
+                              seed, split_dir, subsample_entities=None):
     """
     MARIO forecasting split (replaces the FCPM K-fold / GroupKFold split).
 
@@ -50,6 +50,7 @@ def split_dataset_forecasting(dataset_name, data_path, horizon,
     print(f"Holdout entity fraction: {holdout_entity_fraction}")
     print(f"Chronological split ratio: {chrono_split_ratio}")
     print(f"Seed: {seed}")
+    print(f"Subsample entities: {subsample_entities if subsample_entities else 'None (full dataset)'}")
     print(f"Output split directory: {split_dir}")
 
     try:
@@ -97,6 +98,22 @@ def split_dataset_forecasting(dataset_name, data_path, horizon,
             if n_dropped:
                 print(f"Dropped {n_dropped} class-label rows "
                       f"(TemporalPropertyID == -1); forecasting has no classes.")
+
+        # --- Optional entity subsampling (quick runs) ---
+        # Keep only the first N entities (sorted, deterministic) of the dataset.
+        # Done BEFORE the split so the holdout/chrono partition, embargo, manifest,
+        # and every downstream stage operate on the same consistent subset.
+        if subsample_entities is not None and subsample_entities > 0:
+            all_entities = sorted(data['EntityID'].unique())
+            if subsample_entities < len(all_entities):
+                keep = set(all_entities[:subsample_entities])
+                n_rows_before = len(data)
+                data = data[data['EntityID'].isin(keep)]
+                print(f"Subsampled to first {len(keep)} of {len(all_entities)} entities "
+                      f"({n_rows_before} -> {len(data)} rows).")
+            else:
+                print(f"subsample_entities={subsample_entities} >= dataset entity count "
+                      f"({len(all_entities)}); using the full dataset.")
 
         # --- Entity axis: seeded holdout partition ---
         # Sort entity ids first so the permutation is independent of row order.
@@ -212,6 +229,9 @@ if __name__ == "__main__":
                         help="Random seed for the entity holdout partition.")
     parser.add_argument("--split_dir", required=True,
                         help="Output directory for the split (reuses the former fold_1/ slot).")
+    parser.add_argument("--subsample_entities", type=int, default=SUBSAMPLE_ENTITIES,
+                        help="If set, run on only the first N entities (sorted, deterministic). "
+                             "None/absent = full dataset.")
     args = parser.parse_args()
 
     split_dataset_forecasting(
@@ -222,6 +242,7 @@ if __name__ == "__main__":
         chrono_split_ratio=args.chrono_split_ratio,
         seed=args.seed,
         split_dir=args.split_dir,
+        subsample_entities=args.subsample_entities,
     )
 
     sys.exit(0)

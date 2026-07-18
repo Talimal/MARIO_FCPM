@@ -3,3 +3,13 @@ diabetes/
 *.ipynb
 *.csv
 *.out
+
+# SLURM pipeline outputs (saved on disk, not tracked in git)
+experiment_output/
+orchestrator_logs/
+stage0_local_output/
+stage1_local_output/
+stage2_local_output/
+stage3_local_output/
+stage4_local_output/
+stage5_local_output/

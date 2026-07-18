@@ -36,103 +36,10 @@ import json
 try:
     import config
     import experiment_params
-    from experiment_params import Tirp_selection_methods
 except ImportError as e: print(f"FATAL ERROR importing config/params: {e}"); exit(1)
 except AttributeError as e: print(f"FATAL ERROR: Missing value in config.py: {e}"); exit(1)
 except Exception as e: print(f"FATAL ERROR during import: {e}"); exit(1)
 
-
-
-def update_tirp_selection_scores_inplace(tirp_selection_scores_path, feature_matrix_base_dir, top_k_list):
-    """
-    Updates the existing TIRP selection scores file in-place with validation metrics.
-    Adds Score_ and Binary_ columns initialized to 0, then updates directly.
-    """
-    print(f"Updating TIRP selection scores in-place: {tirp_selection_scores_path}")
-    
-    # 1. Load existing scores
-    if not os.path.exists(tirp_selection_scores_path):
-        print(f"Error: Could not find {tirp_selection_scores_path}")
-        return
-        
-    df_scores = pd.read_csv(tirp_selection_scores_path)
-    
-    # Assume the first column identifies the TIRP (e.g., 'TIRP_name' or 'TIRP_ID')
-    tirp_identifier_col = "TIRP_name" if "TIRP_name" in df_scores.columns else df_scores.columns[0]
-    
-    # 2. Define the exact new methods requested from the experiment_params list
-    stage3_valid_methods = ['val_AUC', 'val_AUPRC', 'val_Precision', 'val_F1']
-    new_methods = [m for m in Tirp_selection_methods if m in stage3_valid_methods]
-    
-    if not new_methods:
-        print("No validation metrics specified in Tirp_selection_methods. Skipping in-place update.")
-        return
-    
-    # 3. Initialize Score columns to 0.0 for ALL TIRPs
-    for method in new_methods:
-        score_col = f"Score_{method}"
-        df_scores[score_col] = 0.0
-        
-    # 4. Initialize Binary columns to 0 for ALL combinations
-    for method in new_methods:
-        for k in top_k_list:
-            binary_col = f"Binary_{method}#{k}"
-            df_scores[binary_col] = 0
-            
-    # 5. Collect validation results and update specific TIRPs
-    tirp_dirs = glob.glob(os.path.join(feature_matrix_base_dir, "tirp_*"))
-    valid_updates_count = 0
-    
-    for t_dir in tirp_dirs:
-        summary_file = os.path.join(t_dir, "train_summary_metrics.csv")
-        if os.path.exists(summary_file):
-            try:
-                summary_df = pd.read_csv(summary_file)
-                if not summary_df.empty:
-                    row = summary_df.iloc[0]
-                    t_name = str(row['TIRP_name'])
-                    
-                    # Find the mask for this specific TIRP in the main dataframe
-                    mask = df_scores[tirp_identifier_col].astype(str) == t_name
-                    
-                    if mask.any():
-                        # Update the score columns ONLY for this TIRP
-                        df_scores.loc[mask, "Score_val_AUC"] = float(row.get('val_AUC', 0.0))
-                        df_scores.loc[mask, "Score_val_AUPRC"] = float(row.get('val_AUPRC', 0.0))
-                        df_scores.loc[mask, "Score_val_Precision"] = float(row.get('val_Precision', 0.0))
-                        df_scores.loc[mask, "Score_val_F1"] = float(row.get('val_F1', 0.0))
-                        valid_updates_count += 1
-                        
-            except Exception as e:
-                print(f"Warning: Failed to read/update metrics from {t_dir}: {e}")
-                
-    print(f"Successfully updated scores for {valid_updates_count} TIRPs.")
-
-    # 6. Calculate Top-K and update Binary columns
-    # We use Horizontal_Support as a tie-breaker if it exists, otherwise fallback to the identifier
-    tie_breaker_col = "Horizontal_Support" if "Horizontal_Support" in df_scores.columns else tirp_identifier_col
-    
-    for method in new_methods:
-        score_col = f"Score_{method}"
-        
-        # Sort descending by score, and descending by tie-breaker
-        if tie_breaker_col in df_scores.columns:
-            df_sorted = df_scores.sort_values(by=[score_col, tie_breaker_col], ascending=[False, False])
-        else:
-            df_sorted = df_scores.sort_values(by=[score_col], ascending=[False])
-            
-        for k in top_k_list:
-            binary_col = f"Binary_{method}#{k}"
-            
-            # Extract the index of the top K rows
-            top_k_indices = df_sorted.head(k).index
-            
-            # Set the binary column to 1 for these specific top K indices
-            df_scores.loc[top_k_indices, binary_col] = 1
-
-    # 7. Save back to the EXACT SAME file, overwriting it
-    df_scores.to_csv(tirp_selection_scores_path, index=False)
-    print("In-place update completed and saved.")
 
 
 # --- Setup Logging for Real-time Monitoring ---
@@ -471,6 +378,12 @@ def submit_stage0_job(dataset_params, n_folds, dataset_base_dir, log_dir, base_d
                      f"--horizon {horizon} --holdout_entity_fraction {config.HOLDOUT_ENTITY_FRACTION} "
                      f"--chrono_split_ratio {config.CHRONO_SPLIT_RATIO} --seed {config.SEED} "
                      f"--split_dir \"{split_dir}\"")
+        # Optional entity subsampling for quick runs: per-dataset key overrides the
+        # global config default. Only appended when set (else full dataset).
+        subsample_entities = dataset_params.get('subsample_entities',
+                                                getattr(config, 'SUBSAMPLE_ENTITIES', None))
+        if subsample_entities:
+            arguments += f" --subsample_entities {int(subsample_entities)}"
         return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage0_done_file, log_dir, base_dir, config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)
     return False
 
@@ -494,7 +407,7 @@ def submit_stage1_job(dataset_params, fold_num, abs_combo, fold_dir, log_dir, ba
         return submit_sbatch_job(job_name, stage_num, script_path, arguments, stage1_done_file, log_dir, base_dir, config.SBATCH_SCRIPT_TEMPLATE, conda_activation_lines)
     return False
 
-def submit_stage2_job(dataset_params, fold_num, abs_combo, mine_combo, abstraction_run_dir, log_dir, base_dir, event_symbol):
+def submit_stage2_job(dataset_params, fold_num, abs_combo, mine_combo, abstraction_run_dir, log_dir, base_dir):
     stage_num = 2; dataset_name = dataset_params['dataset_name']; abs_param_string = create_param_string(abs_combo, prefix="abs"); mining_param_string = create_param_string(mine_combo, prefix="mine")
     mining_run_dir = os.path.join(abstraction_run_dir, mining_param_string); tirp_objects_output_dir = os.path.join(mining_run_dir, "tirps"); stage2_done_file = os.path.join(mining_run_dir, 'stage2_mining.done')
     if not os.path.exists(stage2_done_file):
@@ -911,10 +824,8 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
         logger.info(f"{'='*60}")
         
         dataset_base_dir = os.path.join(base_dir, dataset_name); os.makedirs(dataset_base_dir, exist_ok=True)
-        event_symbol = dataset_params.get('event_symbol', config.DEFAULT_EVENT_SYMBOL)
         logger.info(f"Dataset directory: {dataset_base_dir}")
-        logger.info(f"Event symbol: {event_symbol}")
-        
+
         # Update status file
         update_status_file(base_dir, dataset_name, {
             'status': 'starting',
@@ -977,22 +888,19 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
             total_abs = len(abstraction_combinations)
             total_mine = len(mining_combinations)
             total_model = len(model_combinations) if model_combinations != [{}] else 0
-            total_tirp_methods = len(Tirp_selection_methods)
-            
+
             logger.info(f"Generated combinations:")
             logger.info(f"  - Abstraction: {total_abs}")
             logger.info(f"  - Mining: {total_mine}")
-            logger.info(f"  - Model: {total_model}")
-            logger.info(f"  - TIRP selection methods: {total_tirp_methods}")
-            
+            logger.info(f"  - Model (Stage 5 aggregation grid): {total_model}")
+
             update_status_file(base_dir, dataset_name, {
                 'status': 'running',
                 'stage': 'combinations_generated',
                 'combinations': {
                     'abstraction': total_abs,
                     'mining': total_mine,
-                    'model': total_model,
-                    'tirp_methods': total_tirp_methods
+                    'model': total_model
                 }
             })
             
@@ -1028,9 +936,6 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
         #   already been sent to SLURM in this session. Prevents double-submission if the
         #   orchestrator restarts or a cycle re-scans the same combination. The authoritative
         #   completion signal is always the *.done file on disk, not membership in these sets.
-        # stage4_selection_updated: Set of job_id_stage2 keys whose TIRP-selection scores
-        #   have already been updated with Stage 3.5 validation metrics (a one-time step that
-        #   must run once per mining run, before Stage 4 forecasting is dispatched).
         # counted_combinations: Tracks which (fold, abs, mine) combos have already been
         #   counted as "complete" to avoid incrementing the progress counter every cycle.
         active_monitoring = True
@@ -1038,8 +943,8 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
         submitted_jobs_stage3 = set(); submitted_jobs_stage3_5 = set()
         submitted_jobs_stage4 = set()   # MARIO Stage 4 is batched by TIRP (like Stage 3)
         submitted_jobs_stage5 = set()
-        stage4_selection_updated = set()  # job_id_stage2 keys with post-3.5 score update done
         counted_combinations = set()
+        plotted_train_barplots = set()  # mining runs whose per-TIRP train-accuracy barplot is done
         deleted_feature_matrices = set()  # Track feature_matrix dirs already cleared
         monitoring_cycles, consecutive_idle_cycles = 0, 0
         max_monitoring_cycles, max_idle_cycles = config.MAX_MONITORING_CYCLES, config.MAX_IDLE_CYCLES
@@ -1114,7 +1019,7 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
 
                         # --- Submit Stage 2 ---
                         if job_id_stage2 not in submitted_jobs_stage2 and not os.path.exists(stage2_done_file):
-                            if submit_stage2_job(dataset_params, fold_num, abs_combo, mine_combo, abstraction_run_dir, log_dir, base_dir, event_symbol): 
+                            if submit_stage2_job(dataset_params, fold_num, abs_combo, mine_combo, abstraction_run_dir, log_dir, base_dir):
                                 submitted_jobs_stage2.add(job_id_stage2); new_jobs_submitted_this_cycle = True
                                 logger.info(f"  Submitted Stage 2: Fold {fold_num}, {abs_param_string}, {mining_param_string}")
 
@@ -1293,25 +1198,28 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
                             except Exception as e:
                                 logger.warning(f"Could not write stage3 sentinel at {stage3_sentinel_path}: {e}")
 
-                        # --- Stage 3.5 Done: one-time TIRP-selection-score update, then Stage 4 ---
-                        # stage4_key ties the one-time score update to the exact (fold, abs, mine)
-                        # config so it runs exactly once per mining run.
-                        stage4_key = job_id_stage2
-                        if stage4_key not in stage4_selection_updated:
-                            print(f"  All Stage 3.5 validations finished for {mining_run_dir}. "
-                                  f"Updating TIRP selection scores with validation metrics...")
-                            current_tirp_selection_file = os.path.join(mining_run_dir, 'tirp_selection_scores.csv')
-                            feature_matrix_dir = os.path.join(mining_run_dir, "feature_matrix")
+                        # Per-TIRP train-accuracy summary barplot (Stage 3.5): one horizontal
+                        # bar per TIRP model, ordered best->worst. Run once per mining run, now
+                        # that all its train_summary_metrics.csv exist; saved into
+                        # mining_run_dir/viz so it survives any feature_matrix cleanup.
+                        if getattr(config, 'RUN_STAGE3_5_VALIDATION', True) and \
+                                job_id_stage2 not in plotted_train_barplots:
                             try:
-                                update_tirp_selection_scores_inplace(
-                                    tirp_selection_scores_path=current_tirp_selection_file,
-                                    feature_matrix_base_dir=feature_matrix_dir,
-                                    top_k_list=config.MAX_TIRPS_FOR_SELECTION
+                                import pipeline_viz
+                                pipeline_viz.save_tirp_train_accuracy_barplot(
+                                    feature_matrix_dir=built_models_base_dir,
+                                    out_dir=mining_run_dir,
+                                    title_suffix=f"{dataset_name} | fold {fold_num} | "
+                                                 f"{abs_param_string} | {mining_param_string}",
                                 )
-                            except Exception as update_error:
-                                print(f"CRITICAL ERROR updating TIRP selection scores: {update_error}")
-                            stage4_selection_updated.add(stage4_key)
-                            print("Proceeding to Stage 4 (forecast on TEST set)...")
+                            except Exception as e:
+                                logger.warning(f"Per-TIRP train-accuracy barplot failed (non-fatal): {e}")
+                            plotted_train_barplots.add(job_id_stage2)
+
+                        # --- Stage 3.5 Done: proceed to Stage 4 (forecast on TEST set) ---
+                        # (MARIO drops FCPM's TIRP-selection-score update: Stage 5 aggregates
+                        # every TIRP's forecasts directly, so there is no Binary_{method}#{K}
+                        # selection step here.)
 
                         # --- Submit Stage 4 forecast jobs, BATCHED by TIRP (mirrors Stage 3) ---
                         # Same TIRP list, sorting, and per-TIRP done-file completion scan as
@@ -1586,6 +1494,49 @@ def run_full_experiment(datasets_list, n_folds, base_dir):
 
 
 
+def _format_horizon_tag(hv):
+    """Filesystem-safe horizon suffix: 5.0 -> 'h5', 2.5 -> 'h2_5'."""
+    try:
+        f = float(hv)
+        hv = int(f) if f.is_integer() else f
+    except (TypeError, ValueError):
+        pass
+    return "h" + str(hv).replace(".", "_")
+
+
+def expand_datasets_by_horizon(datasets):
+    """
+    Turn each dataset whose 'horizon' is a LIST into one independent experiment per
+    horizon. Horizon changes the Stage 0 embargo (and every downstream label), so
+    each horizon needs its own output tree — we give it a distinct dataset_name by
+    appending '_h<horizon>' (e.g. diabetes -> diabetes_h1, diabetes_h5). Each expanded
+    entry keeps a scalar 'horizon', so the rest of the pipeline is unchanged.
+
+    A scalar 'horizon' (or a missing one) yields a single entry with the name left
+    as-is (backward compatible). '_base_dataset_name' records the original name so the
+    --datasets CLI can select all horizons of a dataset by its base name.
+    """
+    expanded = []
+    for d in datasets:
+        base = d.get("dataset_name")
+        h = d.get("horizon", None)
+        if isinstance(h, (list, tuple)):
+            if len(h) == 0:
+                print(f"WARNING: dataset '{base}' has an empty horizon list; skipping.")
+                continue
+            for hv in h:
+                dd = dict(d)
+                dd["horizon"] = hv
+                dd["dataset_name"] = f"{base}_{_format_horizon_tag(hv)}"
+                dd["_base_dataset_name"] = base
+                expanded.append(dd)
+        else:
+            dd = dict(d)
+            dd["_base_dataset_name"] = base
+            expanded.append(dd)
+    return expanded
+
+
 # --- Main Execution Block ---
 if __name__ == "__main__":
     # Import configuration and parameters (essential step)
@@ -1609,16 +1560,25 @@ if __name__ == "__main__":
                             help="Comma-separated dataset_name(s) to run. Default: all in experiment_params.datasets_to_run")
     cli_args = cli_parser.parse_args()
 
-    all_datasets = experiment_params.datasets_to_run
+    # Expand any list-valued 'horizon' into one experiment per horizon (distinct
+    # dataset_name '<name>_h<horizon>'), so multiple horizons run as separate experiments.
+    all_datasets = expand_datasets_by_horizon(experiment_params.datasets_to_run)
     if cli_args.datasets:
         requested_names = [n.strip() for n in cli_args.datasets.split(",") if n.strip()]
-        name_to_dataset = {d.get("dataset_name"): d for d in all_datasets}
-        missing = [n for n in requested_names if n not in name_to_dataset]
+        # A requested name matches either an expanded name (diabetes_h5) or a base
+        # dataset name (diabetes -> all its horizons).
+        selected_datasets = [
+            d for d in all_datasets
+            if d.get("dataset_name") in requested_names
+            or d.get("_base_dataset_name") in requested_names
+        ]
+        matched = {n for n in requested_names for d in all_datasets
+                   if d.get("dataset_name") == n or d.get("_base_dataset_name") == n}
+        missing = [n for n in requested_names if n not in matched]
         if missing:
             print(f"FATAL ERROR: dataset(s) not found in experiment_params.datasets_to_run: {missing}")
-            print(f"Available dataset names: {list(name_to_dataset.keys())}")
+            print(f"Available experiment names: {[d.get('dataset_name') for d in all_datasets]}")
             exit(1)
-        selected_datasets = [name_to_dataset[n] for n in requested_names]
     else:
         selected_datasets = all_datasets
 

@@ -305,6 +305,15 @@ def run_single_aggregation_evaluation(prediction_output_dir, split_manifest_path
     if len(metrics):
         print(metrics.to_string(index=False))
 
+    # --- Summary visualization (non-fatal): MARIO accuracy vs majority baseline per scope. ---
+    try:
+        from pipeline_viz import save_stage5_accuracy_vs_baseline
+        save_stage5_accuracy_vs_baseline(results_output_dir,
+                                         aggregation_method=aggregation_method,
+                                         context_window=context_window)
+    except Exception as e:
+        print(f"[viz] Stage 5 visualization skipped (non-fatal): {e}")
+
     done_path = os.path.join(results_output_dir, "stage5_aggregation.done")
     with open(done_path, "w") as f:
         f.write("done")

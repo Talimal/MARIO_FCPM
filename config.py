@@ -3,9 +3,17 @@ import os
 # --- Directory Settings ---
 # ** USER ACTION REQUIRED: Update this path to the directory containing wrapper scripts **
 CODE_DIR = "/mnt/new_groups/robertmo_group/Tali/CPM_Framework_2/"# Example: '/home/user/my_experiment/code' or '.' if in same directory
-# Base directory for all experiment output
+# Base directory for all experiment output.
+# All SLURM-pipeline outputs (folds, abstraction, mined TIRPs, models, forecasts,
+# metrics, PNG visualizations and every intermediate dataframe) are written under
+# here. Kept INSIDE the project working directory so results live next to the code
+# and are saved/persisted (nothing is deleted: see DELETE_* flags below).
+# Override with the CPM_BASE_OUTPUT_DIR env var if you ever need it elsewhere.
 # BASE_OUTPUT_DIR =  "/mnt/new_groups/robertmo_group/Niv/Falls_PAA3_val_CPML16042026/"
-BASE_OUTPUT_DIR =  "/mnt/new_groups/robertmo_group/Tali/FCPM_expirment"
+BASE_OUTPUT_DIR = os.environ.get(
+    "CPM_BASE_OUTPUT_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "experiment_output"),
+)
 
 # --- Core Experiment Settings ---
 N_FOLDS = 1  # Number of cross-validation folds
@@ -20,6 +28,14 @@ CHRONO_SPLIT_RATIO = 0.8
 # Default forecast horizon / embargo size, used when a dataset does not set
 # its own 'horizon'. HORIZON is conceptually per-dataset.
 DEFAULT_HORIZON = 1
+
+# --- Optional entity subsampling (quick runs) ---
+# Global default for how many entities the experiment runs on. If set to an int
+# N, Stage 0 keeps only the first N entities (sorted, deterministic) BEFORE the
+# split, so train/test/manifest and every downstream stage stay consistent and
+# the whole pipeline runs on the subsample. None = full dataset.
+# A per-dataset 'subsample_entities' key in experiment_params.py overrides this.
+SUBSAMPLE_ENTITIES = None
 
 # --- MARIO TIRP selection (Stage 2) ---
 # All mined TIRPs are kept, then filtered to those whose vertical support
@@ -112,7 +128,11 @@ def nb_local_dirs(project_dir=None, dataset_name=NB_DATASET_NAME, fold=NB_FOLD):
 
 DEFAULT_EVENT_SYMBOL = 999  # Default event symbol if not specified per dataset
 BUILD_CPML = True  # Flag to build and evaluate the CPML model
-RUN_STAGE3_5_VALIDATION = False # Make Stage 3.5 optional
+RUN_STAGE3_5_VALIDATION = True # Stage 3.5 train-set forecast-accuracy check per TIRP.
+# Enabled so the pipeline produces each TIRP model's train predictions
+# (train_summary_metrics.csv) and the per-TIRP train-accuracy barplot
+# (pipeline_viz.save_tirp_train_accuracy_barplot). Set False to skip it (no train
+# metrics / barplot, one fewer batch job per mining run).
 
 # Flag to control Train Validation behavior (Stage 3.5):
 # True  = Conditional Validation: Evaluate only on entities where the TIRP actually appears (focuses on precision and conditional predictive power).

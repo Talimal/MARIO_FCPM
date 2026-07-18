@@ -171,6 +171,14 @@ def run_single_mining_task(abstraction_output_dir, mining_run_dir, tirp_objects_
 
     print(f"Selected {len(tirps_to_save)}/{len(frequent_tirps)} TIRPs; saved {saved_count} "
           f"objects to {tirp_objects_output_dir}")
+
+    # --- Summary visualization (non-fatal): TIRP size + vertical-support distributions. ---
+    try:
+        from pipeline_viz import save_stage2_tirp_distributions
+        save_stage2_tirp_distributions(mining_run_dir, mvs=mvs, vs_min=vs_min, vs_max=vs_max)
+    except Exception as e:
+        print(f"[viz] Stage 2 visualization skipped (non-fatal): {e}")
+
     print(f"--- Finished Stage 2: TIRP Mining. Total Time: {time.time() - start_total_time:.2f} seconds ---")
 
 

@@ -289,6 +289,13 @@ def run_single_abstraction(abstraction_output_dir, train_data_file, test_data_fi
         )
         print(f"  Test abstraction finished. Time: {time.time() - start_time:.2f} seconds.")
 
+    # --- Summary visualization (non-fatal): raw signal colored by learned StateID. ---
+    try:
+        from pipeline_viz import save_stage1_abstraction_example
+        save_stage1_abstraction_example(abstraction_output_dir, d_method=d_method, num_of_bins=num_of_bins)
+    except Exception as e:
+        print(f"[viz] Stage 1 visualization skipped (non-fatal): {e}")
+
     print("\n--- Finished Stage 1: Abstraction ---")
 
 
